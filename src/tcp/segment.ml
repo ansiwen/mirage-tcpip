@@ -363,14 +363,13 @@ module Tx = struct
       let serviceack dupack ack_len seq win =
         let partleft = clearsegs q ack_len q.segs in
         Window.tx_ack q.wnd (Sequence.sub seq partleft) win;
-        match dupack || Window.fast_rec q.wnd with
+        match dupack with
         | true ->
+          (* This is a duplicate ACK - increment counter *)
           q.dup_acks <- q.dup_acks + 1;
-          if q.dup_acks = 3 ||
-            (Sequence.to_int32 ack_len > 0l) then begin
-            (* alert window module to fall into fast recovery *)
+          if q.dup_acks = 3 then begin
+            (* Three duplicate ACKs - trigger fast retransmit *)
             Window.alert_fast_rexmit q.wnd seq;
-            (* retransmit the bottom of the unacked list of packets *)
             let rexmit_seg = peek_l q.segs in
             Log.debug (fun fmt ->
                 fmt "TCP fast retransmission seq=%a, dupack=%a"
@@ -386,8 +385,14 @@ module Tx = struct
           end else
             Lwt.return_unit
         | false ->
+          (* Not a duplicate ACK - reset counter *)
           q.dup_acks <- 0;
-          Lwt.return_unit
+          (* If in fast recovery and received new ACK, may need retransmit *)
+          if Window.fast_rec q.wnd && Sequence.to_int32 ack_len > 0l then begin
+            Window.alert_fast_rexmit q.wnd seq;
+            Lwt.return_unit
+          end else
+            Lwt.return_unit
       in
       Lwt_mvar.take tx_ack >>= fun _ ->
       Window.set_ack_serviced q.wnd true;
