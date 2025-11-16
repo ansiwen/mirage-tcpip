@@ -130,11 +130,14 @@ module Rx(ACK: Ack.M) = struct
     else if seg.header.syn then
       `ChallengeAck
     else if Window.valid q.wnd seg.header.sequence then
-      (* Accept ACKs in range [SND.UNA, SND.NXT] per RFC 793 *)
-      if Sequence.between seg.header.ack_number (Window.tx_una q.wnd) (Window.tx_nxt q.wnd) then
+      (* RFC 5961 Section 5.2: Accept ACKs within a reasonable window.
+         Use current TX window size (not max) to limit vulnerability while
+         maintaining RFC 5961 compliance for handling slightly old ACKs. *)
+      let min = Sequence.(sub (Window.tx_una q.wnd) (of_int32 (Window.tx_wnd q.wnd))) in
+      if Sequence.between seg.header.ack_number min (Window.tx_nxt q.wnd) then
         `Ok
       else
-        (* rfc5961 5.2 *)
+        (* rfc5961 5.2 - send challenge ACK for out-of-window ACKs *)
         `ChallengeAck
     else
       `Drop
