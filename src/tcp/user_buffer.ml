@@ -230,14 +230,22 @@ module Tx = struct
       | None -> Lwt.return_unit
       | Some pkt ->
         let b = compactbufs pkt in
-        TXS.output ~flags:Segment.Psh t.txq b >>= fun () ->
-        clear_buffer t
+        (* Don't send zero-length PSH packets *)
+        if Cstruct.length b > 0 then
+          TXS.output ~flags:Segment.Psh t.txq b >>= fun () ->
+          clear_buffer t
+        else
+          clear_buffer t
 
   (* Chunk up the segments into MSS max for transmission *)
   let transmit_segments ~mss ~txq datav =
     let transmit acc =
       let b = compactbufs (List.rev acc) in
-      TXS.output ~flags:Segment.Psh txq b
+      (* Don't send zero-length PSH packets *)
+      if Cstruct.length b > 0 then
+        TXS.output ~flags:Segment.Psh txq b
+      else
+        Lwt.return_unit
     in
     let rec chunk datav acc =
       match datav with
