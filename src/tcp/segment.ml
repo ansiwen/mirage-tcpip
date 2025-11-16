@@ -103,10 +103,15 @@ module Rx(ACK: Ack.M) = struct
     try
       (* Find first segment with FIN flag (should be last valid segment) *)
       let fin_seg = S.find_first (fun seg -> seg.header.fin) q in
-      (* Remove all segments with sequence number after the FIN segment,
-         as data after FIN violates TCP protocol *)
+      (* FIN occupies the sequence number AFTER the segment's data.
+         For example, if FIN segment has seq=100 and 10 bytes of data,
+         the data occupies 100-109 and FIN occupies sequence 110.
+         We should keep all segments that start before sequence 110. *)
+      let fin_seq = Sequence.add fin_seg.header.sequence
+                                 (Sequence.of_int (Cstruct.length fin_seg.payload)) in
+      (* Remove segments that start at or after the FIN sequence *)
       let trimmed = S.filter (fun seg ->
-        Sequence.leq seg.header.sequence fin_seg.header.sequence
+        Sequence.lt seg.header.sequence fin_seq
       ) q in
       (true, trimmed)
     with Not_found ->
