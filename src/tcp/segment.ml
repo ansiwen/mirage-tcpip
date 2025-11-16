@@ -80,7 +80,7 @@ module Rx(ACK: Ack.M) = struct
 
   type t = {
     mutable segs: S.t;
-    rx_data: (Cstruct.t list option * Sequence.t option) Lwt_mvar.t; (* User receive channel *)
+    rx_data: (Cstruct.t list option * Sequence.t option * bool) Lwt_mvar.t; (* User receive channel: (data, winadv, has_fin) *)
     ack: ACK.t;
     tx_ack: (Sequence.t * int) Lwt_mvar.t; (* Acks of our transmitted segs *)
     wnd: Window.t;
@@ -210,11 +210,8 @@ module Rx(ACK: Ack.M) = struct
         let elems = List.rev elems_r in
         let w = if !force_ack || Sequence.(gt winadv zero)
           then Some winadv else None in
-        Lwt_mvar.put q.rx_data (Some elems, w) >>= fun () ->
-        (* If there was a FIN, mark the receive window as closed and tell the application *)
-        (if has_fin then begin
-            Lwt_mvar.put q.rx_data (None, Some Sequence.zero)
-          end else Lwt.return_unit)
+        (* Deliver data with FIN flag to avoid blocking FIN processing on full user buffer *)
+        Lwt_mvar.put q.rx_data (Some elems, w, has_fin)
       in
       tx_ack <&> urx_inform
     | `ChallengeAck ->
@@ -232,7 +229,7 @@ module Rx(ACK: Ack.M) = struct
       in
       txalert (Window.ack_serviced q.wnd) >>= fun () ->
       (* Use the fin path to inform the application of end of stream *)
-      Lwt_mvar.put q.rx_data (None, Some Sequence.zero)
+      Lwt_mvar.put q.rx_data (None, Some Sequence.zero, true)
 end
 
 (* Transmitted segments are sent in-order, and may also be marked

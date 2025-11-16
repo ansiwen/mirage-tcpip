@@ -37,7 +37,7 @@ module Rx (ACK:Ack.M) : sig
   val pp: Format.formatter -> t -> unit
 
   val create:
-    rx_data:(Cstruct.t list option * Sequence.t option) Lwt_mvar.t ->
+    rx_data:(Cstruct.t list option * Sequence.t option * bool) Lwt_mvar.t ->
     ack:ACK.t ->
     wnd:Window.t ->
     state:State.t ->

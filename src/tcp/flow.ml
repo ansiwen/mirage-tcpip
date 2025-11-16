@@ -192,7 +192,7 @@ struct
       let { wnd; ack; urx; _ } = pcb in
       (* Thread to monitor application receive and pass it up *)
       let rec rx_application_t () =
-        Lwt_mvar.take rx_data >>= fun (data, winadv) ->
+        Lwt_mvar.take rx_data >>= fun (data, winadv, has_fin) ->
         let signal_ack = function
           | None        -> Lwt.return_unit
           | Some winadv when Sequence.(gt winadv zero) ->
@@ -209,6 +209,10 @@ struct
             User_buffer.Rx.add_r urx None
           | Some data ->
             signal_ack winadv >>= fun () ->
+            (* Process FIN state transition immediately, before queueing data.
+               This prevents FIN processing from being blocked by a full user buffer. *)
+            (if has_fin then State.tick pcb.state State.Recv_fin);
+            let () = () in
             let rec queue = function
               | []     -> Lwt.return_unit
               | hd::tl ->
@@ -216,6 +220,8 @@ struct
                 queue tl
             in
             queue data >>= fun _ ->
+            (* Add EOF marker to user buffer if FIN was received *)
+            (if has_fin then User_buffer.Rx.add_r urx None else Lwt.return_unit) >>= fun () ->
             rx_application_t ()
         end
       in
