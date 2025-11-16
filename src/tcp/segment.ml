@@ -122,8 +122,8 @@ module Rx(ACK: Ack.M) = struct
     else if seg.header.syn then
       `ChallengeAck
     else if Window.valid q.wnd seg.header.sequence then
-      let min = Sequence.(sub (Window.tx_una q.wnd) (of_int32 (Window.max_tx_wnd q.wnd))) in
-      if Sequence.between seg.header.ack_number min (Window.tx_nxt q.wnd) then
+      (* Accept ACKs in range [SND.UNA, SND.NXT] per RFC 793 *)
+      if Sequence.between seg.header.ack_number (Window.tx_una q.wnd) (Window.tx_nxt q.wnd) then
         `Ok
       else
         (* rfc5961 5.2 *)
