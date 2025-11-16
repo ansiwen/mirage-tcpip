@@ -97,12 +97,20 @@ module Rx(ACK: Ack.M) = struct
     in
     Format.pp_print_list pp_v fmt (S.elements t.segs)
 
-  (* If there is a FIN flag at the end of this segment set.  TODO:
-     should look for a FIN and chop off the rest of the set as they
-     may be orphan segments *)
-  let fin q =
-    try (S.max_elt q).header.fin
-    with Not_found -> false
+  (* Check for FIN flag in segment set and remove any orphan segments after FIN.
+     Returns (has_fin, trimmed_set) where trimmed_set has segments after FIN removed. *)
+  let fin_and_trim q =
+    try
+      (* Find first segment with FIN flag (should be last valid segment) *)
+      let fin_seg = S.find_first (fun seg -> seg.header.fin) q in
+      (* Remove all segments with sequence number after the FIN segment,
+         as data after FIN violates TCP protocol *)
+      let trimmed = S.filter (fun seg ->
+        Sequence.leq seg.header.sequence fin_seg.header.sequence
+      ) q in
+      (true, trimmed)
+    with Not_found ->
+      (false, q)
 
   let is_empty q = S.is_empty q.segs
 
@@ -187,20 +195,21 @@ module Rx(ACK: Ack.M) = struct
       in
       (* Inform the user application of new data *)
       let urx_inform =
+        (* Check for FIN and remove any segments after it *)
+        let has_fin, ready_trimmed = fin_and_trim ready in
+        if has_fin && S.cardinal waiting != 0 then
+          Log.info (fun f -> f "FIN received but there are waiting segments (will be dropped)");
         (* TODO: deal with overlapping fragments *)
         let elems_r, winadv = S.fold (fun seg (acc_l, acc_w) ->
             (if Cstruct.length seg.payload > 0 then seg.payload :: acc_l else acc_l),
             (Sequence.add (len seg) acc_w)
-          ) ready ([], Sequence.zero) in
+          ) ready_trimmed ([], Sequence.zero) in
         let elems = List.rev elems_r in
         let w = if !force_ack || Sequence.(gt winadv zero)
           then Some winadv else None in
         Lwt_mvar.put q.rx_data (Some elems, w) >>= fun () ->
-        (* If the last ready segment has a FIN, then mark the receive
-           window as closed and tell the application *)
-        (if fin ready then begin
-            if S.cardinal waiting != 0 then
-              Log.info (fun f -> f "application receive queue closed, but there are waiting segments.");
+        (* If there was a FIN, mark the receive window as closed and tell the application *)
+        (if has_fin then begin
             Lwt_mvar.put q.rx_data (None, Some Sequence.zero)
           end else Lwt.return_unit)
       in
