@@ -322,7 +322,7 @@ module Tx = struct
                     (Sequence.to_int rexmit_seg.seq));
               Lwt.async
                 (fun () ->
-                   xmit ~flags ~wnd ~options ~seq rexmit_seg.data
+                   xmit ~flags ~wnd ~options ~seq:rexmit_seg.seq rexmit_seg.data
                    (* TODO should this return value really be ignored? *)
                    >|= fun (_: ('a,'b) result) -> () );
               Window.alert_fast_rexmit wnd rexmit_seg.seq;
@@ -394,7 +394,7 @@ module Tx = struct
             let flags=rexmit_seg.flags in
             let options=[] in (* TODO: put the right options *)
             Lwt.async (fun () ->
-                q.xmit ~flags ~wnd ~options ~seq rexmit_seg.data
+                q.xmit ~flags ~wnd ~options ~seq:rexmit_seg.seq rexmit_seg.data
                 (* TODO should this return value really be ignored? *)
                 >|= fun (_: ('a,'b) result) -> () );
             Lwt.return_unit
