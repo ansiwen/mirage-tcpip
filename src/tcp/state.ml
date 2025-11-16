@@ -92,8 +92,13 @@ let pp_tcpstate fmt = function
 
 let pp fmt t = pf fmt "{ %a }" pp_tcpstate t.state
 
-let fin_wait_2_time = (* 60 *) Duration.of_sec 10
-let time_wait_time = (* 30 *) Duration.of_sec 2
+(* FIN_WAIT_2 timeout: time to wait for remote FIN after our FIN is ACKed *)
+let fin_wait_2_time = Duration.of_sec 60
+(* TIME_WAIT timeout: RFC 793 specifies 2*MSL (typically 4 minutes),
+   but modern implementations often use shorter values. Using 60 seconds
+   as a compromise to prevent port reuse issues while not tying up
+   resources for too long. *)
+let time_wait_time = Duration.of_sec 60
 
 let rec finwait2timer t count timeout =
   Log.debug (fun fmt -> fmt "finwait2timer %Lu" timeout);
