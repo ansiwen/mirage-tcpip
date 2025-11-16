@@ -23,7 +23,7 @@ module Log = (val Logs.src_log src : Logs.LOG)
 module Make(Ip: Tcpip.Ip.S) =
 struct
 
-  module ACK = Ack.Immediate
+  module ACK = Ack.Delayed
   module RXS = Segment.Rx(ACK)
   module TXS = Segment.Tx
   module UTX = User_buffer.Tx
