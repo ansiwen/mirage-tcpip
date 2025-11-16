@@ -156,7 +156,10 @@ let tick t (i:action) =
     | Fin_wait_1 a, Recv_fin -> Closing a
     | Fin_wait_1 _, Timeout -> t.on_close (); Closed
     | Fin_wait_1 _, Recv_rst -> t.on_close (); Reset
-    | Fin_wait_2 i, Recv_ack _ -> Fin_wait_2 (i + 1)
+    (* In FIN_WAIT_2, don't increment counter on ACK to prevent timer reset.
+       Incrementing allowed attackers to keep connections alive indefinitely
+       by sending ACKs. Stay in same state with same counter. *)
+    | Fin_wait_2 i, Recv_ack _ -> Fin_wait_2 i
     | Fin_wait_2 _, Recv_rst -> t.on_close (); Reset
     | Fin_wait_2 _, Recv_fin -> transition_to_timewait t
     | Closing a, Recv_ack b ->
