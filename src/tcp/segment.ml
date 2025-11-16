@@ -109,9 +109,11 @@ module Rx(ACK: Ack.M) = struct
          We should keep all segments that start before sequence 110. *)
       let fin_seq = Sequence.add fin_seg.header.sequence
                                  (Sequence.of_int (Cstruct.length fin_seg.payload)) in
-      (* Remove segments that start at or after the FIN sequence *)
+      (* Remove segments that start at or after the FIN sequence.
+         Special case: always keep the FIN segment itself, even if it has
+         no payload (otherwise it would be filtered out when fin_seq == seg.seq). *)
       let trimmed = S.filter (fun seg ->
-        Sequence.lt seg.header.sequence fin_seq
+        seg.header.fin || Sequence.lt seg.header.sequence fin_seq
       ) q in
       (true, trimmed)
     with Not_found ->
