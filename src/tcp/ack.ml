@@ -68,6 +68,7 @@ module Delayed : M = struct
     mutable delayedack: Sequence.t;
     mutable delayed: bool;
     mutable pushpending: bool;
+    mutable last_sent_ack: Sequence.t option;
   }
 
   type t = {
@@ -76,7 +77,12 @@ module Delayed : M = struct
   }
 
   let transmitacknow r ack_number =
-    Lwt_mvar.put r.send_ack ack_number
+    (* Check if we already sent this ACK - skip queueing duplicates *)
+    match r.last_sent_ack with
+    | Some last when last = ack_number ->
+      Lwt.return_unit
+    | _ ->
+      Lwt_mvar.put r.send_ack ack_number
 
   let transmitack r ack_number =
     match r.pushpending with
@@ -101,7 +107,8 @@ module Delayed : M = struct
     let pushpending = false in
     let delayed = false in
     let delayedack = last in
-    let r = {send_ack; delayedack; delayed; pushpending} in
+    let last_sent_ack = None in
+    let r = {send_ack; delayedack; delayed; pushpending; last_sent_ack} in
     let expire = ontimer r in
     let period_ns = Duration.of_ms 100 in
     let timer = Tcptimer.t ~period_ns ~expire in
@@ -120,13 +127,14 @@ module Delayed : M = struct
       Tcptimer.start t.timer ack_number
 
 
-  (* Force out an ACK *)
+  (* Force out an ACK - always send, even if duplicate *)
   let pushack t ack_number =
-    transmitacknow t.r ack_number
+    Lwt_mvar.put t.r.send_ack ack_number
 
 
   (* Indicate that an ACK has been transmitted *)
-  let transmit t _ =
+  let transmit t ack_number =
+    t.r.last_sent_ack <- Some ack_number;
     t.r.delayed <- false;
     t.r.pushpending <- false;
     Lwt.return_unit
