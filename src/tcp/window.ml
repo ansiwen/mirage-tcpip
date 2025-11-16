@@ -241,7 +241,8 @@ let alert_fast_rexmit t _ =
 let rto t =
   match t.backoff_count with
   | 0 -> t.rto
-  | _ -> Int64.(mul t.rto (shift_left 2L t.backoff_count))
+  (* RFC 6298: double RTO on each retransmission, i.e., RTO * 2^backoff_count *)
+  | _ -> Int64.(mul t.rto (shift_left 1L t.backoff_count))
 
 let backoff_rto t =
   t.backoff_count <- t.backoff_count + 1;
