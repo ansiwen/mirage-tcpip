@@ -105,7 +105,8 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
 (* Check if a sequence number is in the right range *)
 let valid t seq =
   let redge = Sequence.(add t.rx_nxt (of_int32 t.rx_wnd)) in
-  let ledge = Sequence.(sub t.rx_nxt (of_int32 t.max_rx_wnd)) in
+  (* Accept segments in window [RCV.NXT, RCV.NXT + RCV.WND) per RFC 793 *)
+  let ledge = t.rx_nxt in
   let r = Sequence.between seq ledge redge in
   Log.debug (fun f -> f "sequence validation: seq=%a range=%a[%lu] res=%b"
     Sequence.pp seq Sequence.pp t.rx_nxt t.rx_wnd r);
