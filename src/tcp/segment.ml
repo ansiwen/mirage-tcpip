@@ -336,10 +336,22 @@ module Tx = struct
         let seg_len = (len s) in
         match Sequence.lt ack_remaining seg_len with
         | true ->
-          Log.debug (fun f -> f "Partial ACK received");
-          (* return uncleared segment to the sequence *)
-          lwt_sequence_add_l s segs;
-          ack_remaining
+          Log.debug (fun f -> f "Partial ACK received: ack_remaining=%a seg_len=%a"
+            Sequence.pp ack_remaining Sequence.pp seg_len);
+          (* Partial ACK: only part of this segment was acknowledged.
+             Modify the segment to remove the ACKed portion. *)
+          let acked_len_int = Sequence.to_int ack_remaining in
+          (* For data segments, shift past the ACKed bytes *)
+          let new_data = if acked_len_int <= Cstruct.length s.data then
+                           Cstruct.shift s.data acked_len_int
+                         else
+                           s.data in
+          let new_seq = Sequence.add s.seq ack_remaining in
+          (* Note: assumes SYN/FIN are fully ACKed or not at all,
+             which is typical since they occupy sequence space at boundaries *)
+          let new_seg = { data = new_data; flags = s.flags; seq = new_seq } in
+          lwt_sequence_add_l new_seg segs;
+          Sequence.zero
         | false ->
           ack_segment q s;
           clearsegs q (Sequence.sub ack_remaining seg_len) segs
