@@ -121,15 +121,19 @@ class TCPAnalyzer:
         else:
             print("[-] No response")
 
-        # Test 5: Rate limiting test
-        print("\n[*] Test 1e: Testing Challenge ACK rate limiting")
-        print("[*] Sending 20 invalid packets in 1 second...")
+        # Test 5: Rate limiting test - CORRECTED
+        print("\n[*] Test 1e: Testing Challenge ACK rate limiting (CORRECTED)")
+        print("[*] Sending 20 packets with IN-WINDOW seq but INVALID ack...")
 
         responses = 0
         start = time.time()
         for i in range(20):
+            # CORRECTED: Use IN-WINDOW sequence, INVALID ack
+            valid_seq = self.conn_state['our_seq'] + (i * 100) % self.conn_state['window']
+            invalid_ack = self.conn_state['their_seq'] + 0x7FFFFFFF
+
             pkt = TCP(sport=self.source_port, dport=self.target_port,
-                     flags='A', seq=future_seq + i*100, ack=self.conn_state['their_seq'])
+                     flags='A', seq=valid_seq, ack=invalid_ack)
             response = sr1(ip/pkt, timeout=0.05, verbose=0)
             if response and response.haslayer(TCP):
                 responses += 1
