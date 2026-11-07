@@ -61,3 +61,8 @@ val time_wait_time : int64
 val finwait2timer : t -> int -> int64 -> unit Lwt.t
 val timewait : t -> int64 -> unit Lwt.t
 val tick : t -> action -> unit
+
+val user_close : t -> unit
+(** [user_close t] records that the application closed the connection (as
+    opposed to only shutting down its write side). This arms the FIN_WAIT_2
+    timeout, which would otherwise wait for the peer's FIN indefinitely. *)

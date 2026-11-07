@@ -126,13 +126,17 @@ struct
     (* Queue up an immediate close segment *)
     let shutdown ctx pcb =
       Log.debug (fun f -> f "%s connection %a" (match ctx with `Close -> "Closing" | `Shutdown -> "Shutting down") WIRE.pp pcb.id);
+      if ctx = `Close then State.user_close pcb.state;
       match State.state pcb.state with
       | State.Established | State.Close_wait ->
         UTX.wait_for_flushed pcb.utx >>= fun () ->
-        (let { wnd; _ } = pcb in
-         State.tick pcb.state (State.Send_fin (Window.tx_nxt wnd));
-         TXS.output ~flags:Segment.Fin pcb.txq Cstruct.empty
-        )
+        (* the connection may have been reset or timed out while flushing *)
+        begin match State.state pcb.state with
+          | State.Established | State.Close_wait ->
+            State.tick pcb.state (State.Send_fin (Window.tx_nxt pcb.wnd));
+            TXS.output ~flags:Segment.Fin pcb.txq Cstruct.empty
+          | _ -> Lwt.return_unit
+        end
       | State.Closed | State.Syn_rcvd _ | State.Syn_sent _ when ctx = `Close ->
         State.on_close pcb.state;
         Lwt.return_unit
@@ -190,6 +194,11 @@ struct
        and notifies the ACK subsystem that new data is here *)
     let thread pcb ~rx_data =
       let { wnd; ack; urx; _ } = pcb in
+      (* Set once the peer's FIN was delivered.  The thread keeps running after
+         that: segments still arrive (e.g. a retransmitted FIN whose ACK was
+         lost) and must be ACKed, and [Segment.Rx.input] blocks on [rx_data]
+         if nobody takes from it. *)
+      let fin_received = ref false in
       (* Thread to monitor application receive and pass it up *)
       let rec rx_application_t () =
         Lwt_mvar.take rx_data >>= fun (data, winadv) ->
@@ -205,8 +214,13 @@ struct
         begin match data with
           | None ->
             (* don't send an ACK in this case; this already happened *)
-            State.tick pcb.state State.Recv_fin;
-            User_buffer.Rx.add_r urx None
+            if !fin_received then rx_application_t ()
+            else begin
+              fin_received := true;
+              State.tick pcb.state State.Recv_fin;
+              User_buffer.Rx.add_r urx None >>= fun () ->
+              rx_application_t ()
+            end
           | Some data ->
             signal_ack winadv >>= fun () ->
             let rec queue = function
@@ -215,7 +229,8 @@ struct
                 User_buffer.Rx.add_r urx (Some hd) >>= fun () ->
                 queue tl
             in
-            queue data >>= fun _ ->
+            (* data after the FIN is a protocol violation; don't deliver it *)
+            (if !fin_received then Lwt.return_unit else queue data) >>= fun () ->
             rx_application_t ()
         end
       in
@@ -361,7 +376,16 @@ struct
     (* The window handling thread *)
     let tx_wnd_update = Lwt_mvar.create_empty () in
     (* Set up transmit and receive queues *)
-    let on_close () = clearpcb t id tx_isn in
+    (* Set once [utx] exists (it depends on [state], which needs [on_close]). *)
+    let wake_writers = ref (fun () -> Lwt.return_unit) in
+    let on_close () =
+      clearpcb t id tx_isn;
+      (* The connection is gone (normal close, reset, retransmission or
+         FIN_WAIT_2 timeout): blocked readers get [`Eof] and blocked writers
+         [`Closed], as documented for [Tcpip.Tcp.S], instead of hanging. *)
+      Lwt.async (fun () -> User_buffer.Rx.add_r urx None);
+      Lwt.async (fun () -> !wake_writers ())
+    in
     let state =
       incr pcb_id;
       State.t ~id:!pcb_id ~on_close
@@ -373,6 +397,7 @@ struct
     let ack = ACK.t ~send_ack ~last:(Sequence.succ rx_isn) in
     (* The user application transmit buffer *)
     let utx = UTX.create ~wnd ~txq ~max_size:16384l in
+    wake_writers := (fun () -> UTX.reset utx);
     let rxq = RXS.create ~rx_data ~ack ~wnd ~state ~tx_ack in
     (* Set up the keepalive state if requested *)
     let keepalive = match keepalive with
@@ -621,7 +646,13 @@ struct
         | Ok () -> writefn pcb wfn @@ Cstruct.sub data av_len (len - av_len)
         | Error _ as e -> Lwt.return e
       end
-    | _ -> Lwt.return (Error `Not_ready)
+    | State.Listen | State.Syn_rcvd _ | State.Syn_sent _ ->
+      Lwt.return (Error `Not_ready)
+    (* flows are only handed out once established, so [Closed] here means the
+       connection was torn down (e.g. retransmission timeout) *)
+    | State.Closed | State.Reset | State.Fin_wait_1 _ | State.Fin_wait_2 _ | State.Closing _
+    | State.Time_wait | State.Last_ack _ ->
+      Lwt.return (Error `Closed)
 
   let rec iter_s f = function
     | [] -> Lwt.return (Ok ())

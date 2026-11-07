@@ -366,8 +366,12 @@ module Tx = struct
             let { wnd; _ } = q in
             let flags=rexmit_seg.flags in
             let options=[] in (* TODO: put the right options *)
+            (* The segment must go out under its own sequence number: [seq] is
+               the ACK number, which can point into the middle of the segment
+               (partial ACK), and sending the head segment's data under it
+               would corrupt the peer's stream. *)
             Lwt.async (fun () ->
-                q.xmit ~flags ~wnd ~options ~seq rexmit_seg.data
+                q.xmit ~flags ~wnd ~options ~seq:rexmit_seg.seq rexmit_seg.data
                 (* TODO should this return value really be ignored? *)
                 >|= fun (_: ('a,'b) result) -> () );
             Lwt.return_unit

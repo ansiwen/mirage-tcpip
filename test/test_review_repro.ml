@@ -1,7 +1,12 @@
-(* Reproductions for findings from a review of src/tcp.  Each test asserts the
-   RFC-correct behaviour, so a FAILING test confirms the corresponding bug.
-   All are marked `Slow so the default (quick) test run stays green; run with
-   e.g. `./test.exe test review_repro 7` from _build/default/test. *)
+(* Packet-level regression tests for bugs found while reviewing src/tcp.
+   Each test asserts the RFC-correct behaviour.
+
+   - `Quick tests cover bugs that are fixed and run in the default test run.
+   - The retransmission-timeout test is `Slow only because it needs ~3 minutes
+     of real time for the retransmission timer to give up.
+   - Tests named "KNOWN BUG" still fail; they are `Slow so the default run
+     stays green.  Run one with e.g. `./test.exe test review_repro 0` from
+     _build/default/test. *)
 
 open Common
 open Low_level
@@ -209,8 +214,14 @@ let rexmit_timeout_wakes_reader () =
     or_error "connect" conn (Ipaddr.V4 server_ip, 80) >>= fun flow ->
     VNETIF_STACK.Stack.TCP.write flow (Cstruct.create 100) >>= fun _ ->
     let t0 = Unix.gettimeofday () in
-    VNETIF_STACK.Stack.TCP.read flow >|= fun _ ->
-    Logs.app (fun m -> m "REPRO: reader woken after %.0fs" (Unix.gettimeofday () -. t0))
+    VNETIF_STACK.Stack.TCP.read flow >>= fun r ->
+    Logs.app (fun m -> m "reader woken after %.0fs" (Unix.gettimeofday () -. t0));
+    (match r with
+     | Ok `Eof -> ()
+     | _ -> Alcotest.fail "expected Ok `Eof from read after retransmission timeout");
+    VNETIF_STACK.Stack.TCP.write flow (Cstruct.create 1) >|= function
+    | Error `Closed -> ()
+    | _ -> Alcotest.fail "expected Error `Closed from write after retransmission timeout"
   in
   `Long (240, (`SYN, fsm), sut)
 
@@ -242,6 +253,29 @@ let half_close_quiet_peer () =
   in
   `Long (20, (`SYN, fsm), sut)
 
+(* 9. The FIN_WAIT_2 timeout must still reclaim a connection the application
+   [close]d when the peer ACKs our FIN but never sends its own. *)
+let orphan_fin_wait_2_reclaimed () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `SYN -> syn_ack ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `FIN
+    | `FIN when Tcp_wire.get_fin data ->
+      WIRE.xmit ~ip (reply_id_from ~src ~dst data) ~rx_ack:(ack data)
+        ~seq:(Sequence.of_int32 1000001l) ~window ~options:[] (Cstruct.create 0)
+      >|= Result.get_ok >|= fun () -> Fsm_done  (* ...and never send our FIN *)
+    | s -> Lwt.return (Fsm_next s)
+  in
+  let sut stack =
+    let tcp = VNETIF_STACK.Stack.tcp stack in
+    let conn = VNETIF_STACK.Stack.TCP.create_connection tcp in
+    or_error "connect" conn (Ipaddr.V4 server_ip, 80) >>= fun flow ->
+    VNETIF_STACK.Stack.TCP.close flow >>= fun () ->
+    Mirage_sleep.ns (Duration.of_sec 12) >|= fun () ->
+    Alcotest.(check int) "orphaned FIN_WAIT_2 connection reclaimed" 0
+      (VNETIF_STACK.T.num_open_channels tcp)
+  in
+  `Long (20, (`SYN, fsm), sut)
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -255,14 +289,17 @@ let run_test name = function
     VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap backend ~kick:no_kick fsm sut)
 
 let suite = [
-  "1 synack rexmit keeps options", `Slow, run_test "r1" (synack_rexmit_options ());
-  "2 duplicate SYN keeps half-open", `Slow, run_test "r2" (duplicate_syn ());
-  "3 retransmitted FIN is re-ACKed", `Slow, run_test "r3" (fin_retransmit_acked ());
-  "4a OOO reassembly (control, no wrap)", `Slow, run_test "r4a" (ooo_reassembly ~isn:1000000l ());
-  "4b OOO reassembly across 2^31", `Slow, run_test "r4b" (ooo_reassembly ~isn:0x7FFFFFF0l ());
-  "5a wscale 14 (control)", `Slow, run_test "r5a" (wscale ~shift:14 ());
-  "5b wscale 16 clamped", `Slow, run_test "r5b" (wscale ~shift:16 ());
-  "6 fast rexmit seq alignment", `Slow, run_test "r6" (fast_rexmit_alignment ());
-  "7 rexmit timeout wakes reader", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
-  "8 half-close quiet peer", `Slow, run_test "r8" (half_close_quiet_peer ());
+  (* fixed *)
+  "fast retransmit uses the segment's own seq", `Quick, run_test "r6" (fast_rexmit_alignment ());
+  "OOO reassembly (no wrap)", `Quick, run_test "r4a" (ooo_reassembly ~isn:1000000l ());
+  "OOO reassembly across 2^31", `Quick, run_test "r4b" (ooo_reassembly ~isn:0x7FFFFFF0l ());
+  "retransmitted FIN is re-ACKed", `Quick, run_test "r3" (fin_retransmit_acked ());
+  "half-closed connection survives a quiet peer", `Quick, run_test "r8" (half_close_quiet_peer ());
+  "orphaned FIN_WAIT_2 connection is reclaimed", `Quick, run_test "r9" (orphan_fin_wait_2_reclaimed ());
+  "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
+  (* not fixed yet *)
+  "KNOWN BUG: SYN-ACK retransmission keeps options", `Slow, run_test "r1" (synack_rexmit_options ());
+  "KNOWN BUG: duplicate SYN keeps the half-open connection", `Slow, run_test "r2" (duplicate_syn ());
+  "wscale 14 (control for the next test)", `Slow, run_test "r5a" (wscale ~shift:14 ());
+  "KNOWN BUG: wscale > 14 is clamped", `Slow, run_test "r5b" (wscale ~shift:16 ());
 ]

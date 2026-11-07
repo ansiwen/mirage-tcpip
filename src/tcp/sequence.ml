@@ -46,7 +46,10 @@ let succ a = Int32.succ a
 (* a - 1 *)
 let pred a = Int32.pred a
 
-let compare a b = Int32.compare a b
+(* Modular (RFC 1982 style) comparison: [a] is before [b] if [b - a] is a
+   positive 32-bit quantity.  This is only a consistent total order for values
+   within 2^31 of each other, which holds for everything inside a TCP window. *)
+let compare a b = Int32.compare (Int32.sub a b) 0l
 let of_int32 t = t
 let of_int t = Int32.of_int t
 let to_int32 t = t

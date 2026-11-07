@@ -324,6 +324,15 @@ module Tx = struct
       | Some _ -> reset_seq segs
     in
     reset_seq t.buffer;
-    inform_app t
+    t.bufbytes <- 0l;
+    (* The connection is gone: wake every blocked writer (and a [close]
+       waiting for the buffer to drain), not just one, so none hangs. *)
+    let rec wake_all () =
+      match Lwt_dllist.take_opt_l t.writers with
+      | None -> ()
+      | Some w -> Lwt.wakeup w (); wake_all ()
+    in
+    wake_all ();
+    Lwt.return_unit
 
 end

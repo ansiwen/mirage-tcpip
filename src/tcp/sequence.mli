@@ -43,6 +43,9 @@ val succ: t -> t
 (* a - 1 *)
 val pred: t -> t
 
+(* Wrap-around aware comparison, consistent with [lt]/[gt]: a negative result
+   means [a] precedes [b] in sequence space.  Only a total order for values
+   within 2^31 of each other. *)
 val compare: t -> t -> int
 val of_int32: int32 -> t
 val of_int: int -> t

@@ -52,10 +52,14 @@ type t = {
   on_close: close_cb;
   id: int;
   mutable state: tcpstate;
+  mutable user_closed: bool;
+  (* The application called [close] (not just [shutdown `write]).  Only then
+     is the FIN_WAIT_2 timer armed: a half-closed connection may legitimately
+     stay in FIN_WAIT_2 for as long as the peer keeps its side open. *)
 }
 
 let t ~id ~on_close =
-  { on_close; id; state=Closed }
+  { on_close; id; state=Closed; user_closed=false }
 
 let on_close t = t.on_close ()
 
@@ -120,53 +124,68 @@ let timewait t twomsl =
   t.on_close ();
   Lwt.return_unit
 
+let start_finwait2timer t count =
+  Lwt.async (fun () -> finwait2timer t count fin_wait_2_time)
+
+let user_close t =
+  if not t.user_closed then begin
+    t.user_closed <- true;
+    match t.state with
+    | Fin_wait_2 i -> start_finwait2timer t i
+    | _ -> ()
+  end
+
 let transition_to_timewait t =
   Lwt.async (fun () -> timewait t time_wait_time);
   Time_wait
 
 let tick t (i:action) =
   let diffone x y = Sequence.succ y = x in
+  (* [on_close] is called only after [t.state] holds the new state, so that
+     whatever it wakes up (readers, writers) observes the closed connection. *)
+  let close = ref false in
+  let closed st = close := true; st in
   let tstr s (i:action) =
     match s, i with
     | Closed, Passive_open -> Listen
     | Closed, Send_syn a -> Syn_sent a
     | Listen, Send_synack a -> Syn_rcvd a
-    | Syn_rcvd _, Timeout -> t.on_close (); Closed
+    | Syn_rcvd _, Timeout -> closed Closed
     | Syn_rcvd _, Recv_rst -> Closed
-    | Syn_sent _, Timeout -> t.on_close (); Closed
+    | Syn_sent _, Timeout -> closed Closed
     | Syn_sent a, Recv_synack b-> if diffone b a then Established else Syn_sent a
     | Syn_rcvd a, Recv_ack b -> if diffone b a then Established else Syn_rcvd a
     | Established, Recv_ack _ -> Established
     | Established, Send_fin a -> Fin_wait_1 a
     | Established, Recv_fin -> Close_wait
-    | Established, Timeout ->  t.on_close (); Closed
-    | Established, Recv_rst -> t.on_close (); Reset
+    | Established, Timeout ->  closed Closed
+    | Established, Recv_rst -> closed Reset
     | Fin_wait_1 a, Recv_ack b ->
       if diffone b a then
         let count = 0 in
-        Lwt.async (fun () -> finwait2timer t count fin_wait_2_time);
+        if t.user_closed then start_finwait2timer t count;
         Fin_wait_2 count
       else
         Fin_wait_1 a
     | Fin_wait_1 a, Recv_fin -> Closing a
-    | Fin_wait_1 _, Timeout -> t.on_close (); Closed
-    | Fin_wait_1 _, Recv_rst -> t.on_close (); Reset
+    | Fin_wait_1 _, Timeout -> closed Closed
+    | Fin_wait_1 _, Recv_rst -> closed Reset
     | Fin_wait_2 i, Recv_ack _ -> Fin_wait_2 (i + 1)
-    | Fin_wait_2 _, Recv_rst -> t.on_close (); Reset
+    | Fin_wait_2 _, Recv_rst -> closed Reset
     | Fin_wait_2 _, Recv_fin -> transition_to_timewait t
     | Closing a, Recv_ack b ->
       if diffone b a then
         transition_to_timewait t
       else Closing a
-    | Closing _, Timeout -> t.on_close (); Closed
-    | Closing _, Recv_rst -> t.on_close (); Reset
-    | Time_wait, Timeout -> t.on_close (); Closed
+    | Closing _, Timeout -> closed Closed
+    | Closing _, Recv_rst -> closed Reset
+    | Time_wait, Timeout -> closed Closed
     | Close_wait,  Send_fin a -> Last_ack a
-    | Close_wait,  Timeout -> t.on_close (); Closed
-    | Close_wait,  Recv_rst -> t.on_close (); Reset
-    | Last_ack a, Recv_ack b -> if diffone b a then (t.on_close (); Closed) else Last_ack a
-    | Last_ack _, Timeout -> t.on_close (); Closed
-    | Last_ack _, Recv_rst -> t.on_close (); Reset
+    | Close_wait,  Timeout -> closed Closed
+    | Close_wait,  Recv_rst -> closed Reset
+    | Last_ack a, Recv_ack b -> if diffone b a then closed Closed else Last_ack a
+    | Last_ack _, Timeout -> closed Closed
+    | Last_ack _, Recv_rst -> closed Reset
     | x, _ -> x
   in
   let old_state = t.state in
@@ -174,3 +193,4 @@ let tick t (i:action) =
   Log.debug (fun fmt -> fmt "%d %a  - %a -> %a" t.id
                 pp_tcpstate old_state pp_action i pp_tcpstate new_state);
   t.state <- new_state;
+  if !close then t.on_close ()
