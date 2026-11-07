@@ -76,6 +76,17 @@ val max_tx_wnd : t -> int32
 
 val alert_fast_rexmit : t -> Sequence.t -> unit
 
+val on_rto : t -> unit
+(** [on_rto t] adjusts the congestion state for an expired retransmission
+    timer (RFC 5681 3.1): ssthresh is halved, cwnd restarts at one segment and
+    loss recovery is entered. Call it before [backoff_rto]. *)
+
+val cwnd : t -> int32
+(** The congestion window, in bytes. *)
+
+val ssthresh : t -> int32
+(** The slow start threshold, in bytes. *)
+
 val rto : t -> int64
 val backoff_rto : t -> unit
 val max_rexmits_done : t -> bool

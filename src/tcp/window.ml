@@ -43,8 +43,11 @@ type t = {
                                       slow start to linear congestion
                                       avoidance *)
   mutable cwnd: int32;             (* congestion window *)
-  mutable fast_recovery: bool;     (* flag to mark if this tcp is in
-                                      fast recovery *)
+  mutable fast_recovery: bool;     (* in loss recovery (fast recovery or
+                                      after a retransmission timeout): partial
+                                      ACKs retransmit the next segment *)
+  mutable rto_recovery: bool;      (* the recovery was entered by a
+                                      retransmission timeout *)
 
   mutable rtt_timer_on: bool;
   mutable rtt_timer_reset: bool;
@@ -87,6 +90,7 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
   let ssthresh = tx_wnd in
   let cwnd = Int32.of_int (tx_mss * 2) in
   let fast_recovery = false in
+  let rto_recovery = false in
   let rtt_timer_on = false in
   let rtt_timer_reset = true in
   let rtt_timer_seq = tx_nxt in
@@ -99,7 +103,7 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
     ack_serviced; ack_seq; ack_win;
     snd_una; tx_nxt; tx_wnd; rx_nxt; rx_nxt_inseq;
     fast_rec_th; rx_wnd; tx_wnd_scale; rx_wnd_scale;
-    ssthresh; cwnd; tx_mss; fast_recovery;
+    ssthresh; cwnd; tx_mss; fast_recovery; rto_recovery;
     rtt_timer_on; rtt_timer_reset;
     rtt_timer_seq; rtt_timer_starttime; srtt; rttvar; rto; backoff_count }
 
@@ -169,49 +173,72 @@ let tx_advance t b =
   end;
   t.tx_nxt <- Sequence.add t.tx_nxt b
 
-(* An ACK was received - use it to adjust cwnd *)
+let mss t = Int32.of_int t.tx_mss
+
+(* Congestion window growth for an ACK of [acked] new bytes (RFC 5681 3.1):
+   slow start increases cwnd by at most one MSS per ACK, congestion avoidance
+   by about one MSS per round trip. *)
+let grow_cwnd t acked =
+  let incr =
+    if t.cwnd < t.ssthresh then min acked (mss t)
+    else max (Int32.div (Int32.mul (mss t) (mss t)) t.cwnd) 1l
+  in
+  t.cwnd <- Int32.add t.cwnd incr
+
+let rtt_sample t =
+  t.rtt_timer_on <- false;
+  let rtt_m = Int64.sub (Mirage_mtime.elapsed_ns ()) t.rtt_timer_starttime in
+  if t.rtt_timer_reset then begin
+    t.rtt_timer_reset <- false;
+    t.rttvar <- Int64.div rtt_m 2L;
+    t.srtt <- rtt_m;
+  end else begin
+    let (/) = Int64.div
+    and ( * ) = Int64.mul
+    and (-) = Int64.sub
+    and (+) = Int64.add
+    in
+    (* RFC2988 2.3 *)
+    t.rttvar <- (3L * t.rttvar / 4L) + (Int64.abs (t.srtt - rtt_m) / 4L);
+    t.srtt <- (7L * t.srtt / 8L) + (rtt_m / 8L)
+  end;
+  t.rto <- max (Duration.of_ms 667) Int64.(add t.srtt (mul t.rttvar 4L))
+
+(* An ACK was received - use it to adjust cwnd.  Only ACKs of new data grow
+   the window; in fast recovery duplicate ACKs inflate it and partial ACKs
+   deflate it (RFC 5681 3.2, RFC 6582 3.2). *)
 let tx_ack t r win =
   set_tx_wnd t win;
+  let acked =
+    if Sequence.gt r t.snd_una then Sequence.to_int32 (Sequence.sub r t.snd_una)
+    else 0l
+  in
+  if acked > 0l then begin
+    t.backoff_count <- 0;
+    t.snd_una <- r;
+    (* Karn: the timer is off while retransmitted data is outstanding *)
+    if t.rtt_timer_on && Sequence.gt r t.rtt_timer_seq then rtt_sample t
+  end;
   if t.fast_recovery then begin
-    if Sequence.gt r t.snd_una then
-      t.snd_una <- r;
     if Sequence.geq r t.fast_rec_th then begin
-      Log.debug (fun f -> f "EXITING fast recovery");
-      t.cwnd <- t.ssthresh;
+      Log.debug (fun f -> f "EXITING recovery");
+      (* after fast recovery, deflate to ssthresh; after a timeout cwnd
+         has been growing from one segment by slow start, keep it *)
+      if not t.rto_recovery then t.cwnd <- t.ssthresh;
       t.fast_recovery <- false;
-    end else begin
-      t.cwnd <- (Int32.add t.cwnd (Int32.of_int t.tx_mss));
-    end
-  end else begin
-    if Sequence.gt r t.snd_una then begin
-      t.backoff_count <- 0;
-      t.snd_una <- r;
-      if t.rtt_timer_on && Sequence.gt r t.rtt_timer_seq then begin
-        t.rtt_timer_on <- false;
-        let rtt_m = Int64.sub (Mirage_mtime.elapsed_ns ()) t.rtt_timer_starttime in
-        if t.rtt_timer_reset then begin
-          t.rtt_timer_reset <- false;
-          t.rttvar <- Int64.div rtt_m 2L;
-          t.srtt <- rtt_m;
-        end else begin
-          let (/) = Int64.div
-          and ( * ) = Int64.mul
-          and (-) = Int64.sub
-          and (+) = Int64.add
-          in
-          (* RFC2988 2.3 *)
-          t.rttvar <- (3L * t.rttvar / 4L) + (Int64.abs (t.srtt - rtt_m) / 4L);
-          t.srtt <- (7L * t.srtt / 8L) + (rtt_m / 8L)
-        end;
-        t.rto <- max (Duration.of_ms 667) Int64.(add t.srtt (mul t.rttvar 4L));
-      end;
-    end;
-    let cwnd_incr = match t.cwnd < t.ssthresh with
-      | true -> Int32.of_int t.tx_mss
-      | false -> max (Int32.div (Int32.of_int (t.tx_mss * t.tx_mss)) t.cwnd) 1l
-    in
-    t.cwnd <- Int32.add t.cwnd cwnd_incr
-  end
+      t.rto_recovery <- false
+    end else if t.rto_recovery then
+      (if acked > 0l then grow_cwnd t acked)
+    else if acked > 0l then
+      (* partial ACK: deflate by the amount acked, add back one segment *)
+      t.cwnd <- max (mss t)
+          (Int32.add (Int32.sub t.cwnd acked)
+             (if acked >= mss t then mss t else 0l))
+    else
+      (* duplicate ACK: one more segment has left the network *)
+      t.cwnd <- Int32.add t.cwnd (mss t)
+  end else if acked > 0l then
+    grow_cwnd t acked
 
 let tx_nxt t = t.tx_nxt
 let tx_wnd t = t.tx_wnd
@@ -235,26 +262,51 @@ let tx_inflight t =
   t.tx_nxt <> t.snd_una
 
 
+(* Three duplicate ACKs: enter fast recovery (RFC 5681 3.2, RFC 6582) *)
 let alert_fast_rexmit t _ =
   if not t.fast_recovery then begin
     let inflight = Sequence.to_int32 (Sequence.sub t.tx_nxt t.snd_una) in
     let newssthresh = max (Int32.div inflight 2l) (Int32.of_int (t.tx_mss * 2)) in
-    let newcwnd = Int32.add inflight (Int32.of_int (t.tx_mss * 2)) in
+    let newcwnd = Int32.add newssthresh (Int32.of_int (t.tx_mss * 3)) in
     Log.debug (fun fmt ->
         fmt "ENTERING fast recovery inflight=%ld, ssthresh=%ld -> %ld, \
                     cwnd=%ld -> %ld"
           inflight t.ssthresh newssthresh t.cwnd newcwnd);
     t.fast_recovery <- true;
+    t.rto_recovery <- false;
     t.fast_rec_th <- t.tx_nxt;
     t.ssthresh <- newssthresh;
     t.rtt_timer_on <- false;
     t.cwnd <- newcwnd
   end
 
+(* The retransmission timer expired (RFC 5681 3.1, eq. 4): halve ssthresh
+   (but keep it when the same segment times out again) and restart from a
+   one-segment window.  Enter recovery, so that each partial ACK retransmits
+   the next unacknowledged segment instead of waiting for another timeout.
+   Must be called before [backoff_rto]. *)
+let on_rto t =
+  let inflight = Sequence.to_int32 (Sequence.sub t.tx_nxt t.snd_una) in
+  if t.backoff_count = 0 then
+    t.ssthresh <- max (Int32.div inflight 2l) (Int32.of_int (t.tx_mss * 2));
+  Log.debug (fun f -> f "retransmission timeout: ssthresh=%ld cwnd=%ld -> %d"
+                t.ssthresh t.cwnd t.tx_mss);
+  t.cwnd <- mss t;
+  t.fast_recovery <- true;
+  t.rto_recovery <- true;
+  t.fast_rec_th <- t.tx_nxt;
+  t.rtt_timer_on <- false
+
+let cwnd t = t.cwnd
+let ssthresh t = t.ssthresh
+
+(* RFC 6298 5.5: double the RTO on each backoff; 5.7 allows a maximum of at
+   least 60 seconds. *)
+let max_rto = Duration.of_sec 60
+
 let rto t =
-  match t.backoff_count with
-  | 0 -> t.rto
-  | _ -> Int64.(mul t.rto (shift_left 2L t.backoff_count))
+  let rec backoff r n = if n = 0 || r >= max_rto then r else backoff (Int64.mul r 2L) (n - 1) in
+  min max_rto (backoff t.rto t.backoff_count)
 
 let backoff_rto t =
   t.backoff_count <- t.backoff_count + 1;
