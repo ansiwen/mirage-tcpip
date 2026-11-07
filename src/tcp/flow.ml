@@ -263,14 +263,17 @@ struct
   let hashtbl_find h k =
     try Some (Hashtbl.find h k) with Not_found -> None
 
-  let clearpcb t id tx_isn =
+  (* [wnd] identifies the connection being closed: a stale connection (e.g. an
+     abandoned half-open one) must not remove a newer connection that reuses
+     the same address/port tuple. *)
+  let clearpcb t id tx_isn wnd =
     log_with_stats "removing pcb from connection tables" t;
     match hashtbl_find t.channels id with
-    | Some _ ->
+    | Some (pcb, _) when pcb.wnd == wnd ->
       Hashtbl.remove t.channels id;
       Stats.decr_channel ();
       Log.debug (fun f -> f "removed %a from active channels" WIRE.pp id);
-    | None ->
+    | Some _ | None ->
       match hashtbl_find t.listens id with
       | Some (isn, _) ->
         if isn = tx_isn then (
@@ -293,6 +296,13 @@ struct
     match tx_wnd_scale with
     | None -> (0, 0), []
     | Some tx_f ->
+      (* RFC 7323 2.3: a shift count above 14 MUST be treated as 14 *)
+      let tx_f =
+        if tx_f > 14 then begin
+          Log.warn (fun f -> f "peer sent window scale %d, using 14" tx_f);
+          14
+        end else tx_f
+      in
       (rx_wnd_scaleoffer, tx_f),
       (Options.Window_size_shift rx_wnd_scaleoffer :: [])
 
@@ -379,7 +389,7 @@ struct
     (* Set once [utx] exists (it depends on [state], which needs [on_close]). *)
     let wake_writers = ref (fun () -> Lwt.return_unit) in
     let on_close () =
-      clearpcb t id tx_isn;
+      clearpcb t id tx_isn wnd;
       (* The connection is gone (normal close, reset, retransmission or
          FIN_WAIT_2 timeout): blocked readers get [`Eof] and blocked writers
          [`Closed], as documented for [Tcpip.Tcp.S], instead of hanging. *)
@@ -442,13 +452,8 @@ struct
     new_pcb t params id keepalive >>= fun (pcb, th, opts) ->
     State.tick pcb.state State.Passive_open;
     State.tick pcb.state (State.Send_synack params.tx_isn);
-    (* Add the PCB to our listens table *)
-    if Hashtbl.mem t.listens id then (
-      Log.debug (fun f -> f "duplicate attempt to make a connection: %a .\
-      Removing the old state and replacing with new attempt" WIRE.pp id);
-      Hashtbl.remove t.listens id;
-      Stats.decr_listen ();
-    );
+    (* Add the PCB to our listens table ([process_syn] removed any previous
+       half-open connection for this id) *)
     Hashtbl.add t.listens id (params.tx_isn, (pushf, (pcb, th)));
     Stats.incr_listen ();
     (* Queue a SYN ACK for transmission *)
@@ -534,6 +539,26 @@ struct
     log_with_stats "process-syn" t;
     match Hashtbl.find_opt t.listeners (WIRE.src_port id) with
     | Some (keepalive, process) ->
+      begin match hashtbl_find t.listens id with
+      | Some (_, (_, (pcb, _))) when Sequence.succ sequence = Window.rx_nxt pcb.wnd ->
+        (* The client retransmitted its SYN (our SYN-ACK was lost or is still
+           in flight): answer with the original SYN-ACK, same ISN and options.
+           Creating a new connection here would give the client two SYN-ACKs
+           with different ISNs, and its ACK of the first would be dropped. *)
+        Log.debug (fun f -> f "retransmitted SYN on %a, resending SYN-ACK" WIRE.pp id);
+        TXS.retransmit_head pcb.txq
+      | old ->
+      (match old with
+       | Some (_, (_, (pcb, th))) ->
+         (* A SYN with a different ISN is a new connection attempt from the
+            same port: abandon the old half-open connection.  Moving it to
+            Closed stops its SYN-ACK retransmissions. *)
+         Log.debug (fun f -> f "new SYN on %a replaces half-open connection" WIRE.pp id);
+         Hashtbl.remove t.listens id;
+         Stats.decr_listen ();
+         State.tick pcb.state State.Recv_rst;
+         Lwt.cancel th
+       | None -> ());
       let tx_isn = Sequence.of_int32 (Randomconv.int32 Mirage_crypto_rng.generate) in
       (* TODO: make this configurable per listener *)
       let rx_wnd = 65535 in
@@ -543,6 +568,7 @@ struct
         id process keepalive
       >>= fun _ ->
       Lwt.return_unit
+      end
     | None ->
       Tx.send_rst t id ~sequence ~ack_number ~syn ~fin
       >>= fun _ -> Lwt.return_unit (* discard errors; we won't retry *)

@@ -82,4 +82,9 @@ module Tx : sig
       The transmitter should check that the segment size will not
       be greater than the transmit window.  *)
 
+  val retransmit_head: t -> unit Lwt.t
+  (** [retransmit_head t] immediately resends the oldest unacknowledged
+      segment unchanged (same sequence number, flags and options). Does nothing
+      if no segment is outstanding. *)
+
 end

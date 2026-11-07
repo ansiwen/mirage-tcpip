@@ -244,6 +244,8 @@ module Tx = struct
     data: Cstruct.t;
     flags: tx_flags;
     seq: Sequence.t;
+    options: Options.t list; (* resent unchanged on retransmission, so a
+                                retransmitted SYN(-ACK) keeps MSS/WS *)
   }
 
   (* Sequence length of the segment *)
@@ -300,7 +302,7 @@ module Tx = struct
               Lwt.return Tcptimer.Stoptimer
             ) else (
               let flags = rexmit_seg.flags in
-              let options = [] in (* TODO: put the right options *)
+              let options = rexmit_seg.options in
               Log.debug (fun fmt ->
                   fmt "TCP retransmission triggered by timer! seq = %d"
                     (Sequence.to_int rexmit_seg.seq));
@@ -365,7 +367,7 @@ module Tx = struct
                   Sequence.pp rexmit_seg.seq Sequence.pp seq);
             let { wnd; _ } = q in
             let flags=rexmit_seg.flags in
-            let options=[] in (* TODO: put the right options *)
+            let options=rexmit_seg.options in
             (* The segment must go out under its own sequence number: [seq] is
                the ACK number, which can point into the middle of the segment
                (partial ACK), and sending the head segment's data under it
@@ -432,7 +434,7 @@ module Tx = struct
     let { wnd; _ } = q in
     let ack = Window.rx_nxt wnd in
     let seq = Window.tx_nxt wnd in
-    let seg = { data; flags; seq } in
+    let seg = { data; flags; seq; options } in
     let seq_len = len seg in
     Window.tx_advance q.wnd seq_len;
     (* Queue up segment just sent for retransmission if needed *)
@@ -448,4 +450,14 @@ module Tx = struct
     q.xmit ~flags ~wnd ~options ~seq data >>= fun _ ->
     (* Inform the RX ack thread that we've just sent one *)
     Lwt_mvar.put q.rx_ack ack
+
+  (* Retransmit the oldest unacknowledged segment right away, unchanged (same
+     sequence number, flags and options).  Used to answer a retransmitted SYN
+     in SYN-RCVD with the original SYN-ACK. *)
+  let retransmit_head (T q) =
+    match peek_opt_l q.segs with
+    | None -> Lwt.return_unit
+    | Some s ->
+      q.xmit ~flags:s.flags ~wnd:q.wnd ~options:s.options ~seq:s.seq s.data
+      >|= fun _ -> ()
 end

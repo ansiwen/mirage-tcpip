@@ -4,9 +4,8 @@
    - `Quick tests cover bugs that are fixed and run in the default test run.
    - The retransmission-timeout test is `Slow only because it needs ~3 minutes
      of real time for the retransmission timer to give up.
-   - Tests named "KNOWN BUG" still fail; they are `Slow so the default run
-     stays green.  Run one with e.g. `./test.exe test review_repro 0` from
-     _build/default/test. *)
+   Run one with e.g. `./test.exe test review_repro 0` from
+   _build/default/test. *)
 
 open Common
 open Low_level
@@ -63,8 +62,8 @@ let client_port = 40000
 let client_isn = 5000l
 let client_id = WIRE.v ~src:server_ip ~src_port:client_port ~dst:sut_ip ~dst_port:80
 
-let send_client_syn ip =
-  WIRE.xmit ~ip client_id ~syn:true ~rx_ack:None ~seq:(Sequence.of_int32 client_isn)
+let send_client_syn ?(isn=client_isn) ip =
+  WIRE.xmit ~ip client_id ~syn:true ~rx_ack:None ~seq:(Sequence.of_int32 isn)
     ~window:65535 ~options:[Opt.MSS 1460; Opt.Window_size_shift 7] (Cstruct.create 0)
   >|= Result.get_ok
 
@@ -96,7 +95,7 @@ let synack_rexmit_options () =
                                             (first SYN-ACK had MSS+WS)" Opt.pps pkt.options))
     | s -> Lwt.return (Fsm_next s)
   in
-  `Server (send_client_syn, (`SYNACK1, fsm), sut_listens)
+  `Server ((fun ip -> send_client_syn ip), (`SYNACK1, fsm), sut_listens)
 
 (* 2. A retransmitted SYN while in SYN-RCVD must not replace the half-open
    connection (and its ISN): a client ACKing the first SYN-ACK must succeed. *)
@@ -114,7 +113,7 @@ let duplicate_syn () =
       Lwt.return Fsm_done
     | s -> Lwt.return (Fsm_next s)
   in
-  `Server (send_client_syn, (`SYNACK1, fsm), sut_listens)
+  `Server ((fun ip -> send_client_syn ip), (`SYNACK1, fsm), sut_listens)
 
 (* 3. A retransmitted FIN (our ACK of it was lost) must be ACKed again. *)
 let fin_retransmit_acked () =
@@ -276,6 +275,34 @@ let orphan_fin_wait_2_reclaimed () =
   in
   `Long (20, (`SYN, fsm), sut)
 
+(* 10. A SYN with a different ISN while half-open is a new attempt: it replaces
+   the old half-open connection, which must stop retransmitting its SYN-ACK,
+   and the new connection must work. *)
+let new_syn_replaces_half_open () =
+  let isn2 = 9000l in
+  let fsm ip state ~src:_ ~dst:_ data =
+    let syn = Tcp_wire.get_syn data and seq = Tcp_wire.get_sequence data in
+    match state with
+    | `SYNACK1 when syn ->
+      send_client_syn ~isn:isn2 ip >|= fun () -> Fsm_next (`SYNACK2 seq)
+    | `SYNACK2 a when syn && seq = a ->
+      Lwt.return (Fsm_error "old half-open connection still retransmits its SYN-ACK")
+    | `SYNACK2 a when syn ->
+      (* wait past the old SYN-ACK's RTO (667ms) before completing *)
+      Mirage_sleep.ns (Duration.of_ms 1500) >>= fun () ->
+      WIRE.xmit ~ip client_id ~rx_ack:(Some (Sequence.of_int32 (Int32.succ seq)))
+        ~seq:(Sequence.of_int32 (Int32.succ isn2)) ~window:65535 ~options:[]
+        (Cstruct.create 10)
+      >|= Result.get_ok >|= fun () -> Fsm_next (`DATA_ACK a)
+    | `DATA_ACK a when syn && seq = a ->
+      Lwt.return (Fsm_error "old half-open connection still retransmits its SYN-ACK")
+    | `DATA_ACK _ when (not syn) && Tcp_wire.get_ack data
+                       && Tcp_wire.get_ack_number data = Int32.add isn2 11l ->
+      Lwt.return Fsm_done
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Server ((fun ip -> send_client_syn ip), (`SYNACK1, fsm), sut_listens)
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -289,17 +316,16 @@ let run_test name = function
     VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap backend ~kick:no_kick fsm sut)
 
 let suite = [
-  (* fixed *)
   "fast retransmit uses the segment's own seq", `Quick, run_test "r6" (fast_rexmit_alignment ());
   "OOO reassembly (no wrap)", `Quick, run_test "r4a" (ooo_reassembly ~isn:1000000l ());
   "OOO reassembly across 2^31", `Quick, run_test "r4b" (ooo_reassembly ~isn:0x7FFFFFF0l ());
   "retransmitted FIN is re-ACKed", `Quick, run_test "r3" (fin_retransmit_acked ());
   "half-closed connection survives a quiet peer", `Quick, run_test "r8" (half_close_quiet_peer ());
   "orphaned FIN_WAIT_2 connection is reclaimed", `Quick, run_test "r9" (orphan_fin_wait_2_reclaimed ());
+  "SYN-ACK retransmission keeps options", `Quick, run_test "r1" (synack_rexmit_options ());
+  "retransmitted SYN is answered with the same SYN-ACK", `Quick, run_test "r2" (duplicate_syn ());
+  "new SYN replaces the half-open connection", `Quick, run_test "r10" (new_syn_replaces_half_open ());
+  "wscale 14", `Quick, run_test "r5a" (wscale ~shift:14 ());
+  "wscale > 14 is clamped to 14", `Quick, run_test "r5b" (wscale ~shift:16 ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
-  (* not fixed yet *)
-  "KNOWN BUG: SYN-ACK retransmission keeps options", `Slow, run_test "r1" (synack_rexmit_options ());
-  "KNOWN BUG: duplicate SYN keeps the half-open connection", `Slow, run_test "r2" (duplicate_syn ());
-  "wscale 14 (control for the next test)", `Slow, run_test "r5a" (wscale ~shift:14 ());
-  "KNOWN BUG: wscale > 14 is clamped", `Slow, run_test "r5b" (wscale ~shift:16 ());
 ]
