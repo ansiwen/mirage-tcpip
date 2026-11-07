@@ -222,15 +222,17 @@ struct
               rx_application_t ()
             end
           | Some data ->
-            signal_ack winadv >>= fun () ->
             let rec queue = function
               | []     -> Lwt.return_unit
               | hd::tl ->
                 User_buffer.Rx.add_r urx (Some hd) >>= fun () ->
                 queue tl
             in
-            (* data after the FIN is a protocol violation; don't deliver it *)
+            (* Queue the data before ACKing it, so that the ACK advertises the
+               receive window with this data already accounted for.  Data
+               after the FIN is a protocol violation; don't deliver it. *)
             (if !fin_received then Lwt.return_unit else queue data) >>= fun () ->
+            signal_ack winadv >>= fun () ->
             rx_application_t ()
         end
       in
@@ -382,7 +384,10 @@ struct
     let send_ack = Lwt_mvar.create_empty () in
     (* The user application receive buffer and close notification *)
     let rx_buf_size = Window.rx_wnd wnd in
-    let urx = User_buffer.Rx.create ~max_size:rx_buf_size ~wnd in
+    (* Set up ACK module *)
+    let ack = ACK.t ~send_ack ~last:(Sequence.succ rx_isn) in
+    let on_window_update () = ACK.pushack ack (Window.rx_nxt wnd) in
+    let urx = User_buffer.Rx.create ~max_size:rx_buf_size ~wnd ~on_window_update in
     (* The window handling thread *)
     let tx_wnd_update = Lwt_mvar.create_empty () in
     (* Set up transmit and receive queues *)
@@ -403,8 +408,6 @@ struct
     let txq, _tx_t =
       TXS.create ~xmit:(Tx.xmit_pcb t.ip id) ~wnd ~state ~rx_ack ~tx_ack ~tx_wnd_update
     in
-    (* Set up ACK module *)
-    let ack = ACK.t ~send_ack ~last:(Sequence.succ rx_isn) in
     (* The user application transmit buffer *)
     let utx = UTX.create ~wnd ~txq ~max_size:16384l in
     wake_writers := (fun () -> UTX.reset utx);

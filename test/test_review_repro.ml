@@ -303,6 +303,92 @@ let new_syn_replaces_half_open () =
   in
   `Server ((fun ip -> send_client_syn ip), (`SYNACK1, fsm), sut_listens)
 
+(* 11. Receiver flow control: with an application that does not read, the
+   window must close to 0 (and stay ACKing); data beyond it, like a 1-byte zero
+   window probe, is not accepted but ACKed; reading reopens the window. *)
+let zero_window_advertised () =
+  let rx_wnd = 65535 in
+  let edge = Int32.(add 1000001l (of_int rx_wnd)) in
+  let fsm ip state ~src ~dst data =
+    let id = reply_id_from ~src ~dst data in
+    let ackn = Tcp_wire.get_ack_number data and win = Tcp_wire.get_window data in
+    let send ~seq len = WIRE.xmit ~ip id ~rx_ack:(ack data) ~seq:(Sequence.of_int32 seq)
+        ~window ~options:[] (Cstruct.create len) >|= Result.get_ok in
+    match state with
+    | `SYN -> syn_ack ~window:65535 ~options:[] ip ~src ~dst ~isn:1000000l data
+      >|= fun () -> Fsm_next `ACK
+    | `ACK ->
+      (* more than the whole window *)
+      let rec blast i = if i = 46 then Lwt.return_unit else
+          send ~seq:Int32.(add 1000001l (of_int (i * 1460))) 1460 >>= fun () -> blast (i + 1) in
+      blast 0 >|= fun () -> Fsm_next `ZERO
+    | `ZERO when ackn = edge && win = 0 ->
+      send ~seq:edge 1 >|= fun () -> Fsm_next `PROBE_ACK
+    | `PROBE_ACK when ackn = Int32.succ edge ->
+      Lwt.return (Fsm_error "data was accepted beyond a zero window")
+    | `PROBE_ACK when ackn = edge && win = 0 -> Lwt.return (Fsm_next `UPDATE)
+    | `UPDATE when ackn = edge && win > 0 -> Lwt.return Fsm_done
+    | s -> Lwt.return (Fsm_next s)
+  in
+  let sut stack =
+    let conn = VNETIF_STACK.Stack.TCP.create_connection (VNETIF_STACK.Stack.tcp stack) in
+    or_error "connect" conn (Ipaddr.V4 server_ip, 80) >>= fun flow ->
+    Mirage_sleep.ns (Duration.of_ms 1500) >>= fun () ->   (* not reading *)
+    let rec drain n =
+      if n >= rx_wnd then Lwt.return_unit else
+        VNETIF_STACK.Stack.TCP.read flow >>= function
+        | Ok (`Data b) -> drain (n + Cstruct.length b)
+        | _ -> Alcotest.fail "unexpected end of stream"
+    in
+    drain 0 >>= fun () -> Mirage_sleep.ns (Duration.of_sec 1)
+  in
+  `Long (8, (`SYN, fsm), sut)
+
+(* 12. Persist timer: data is queued against a zero window; the sender must
+   probe (and not send data) until the window opens, then send.  The window
+   update uses 65535, which an earlier bug mistook for "unchanged". *)
+let zero_window_probe () =
+  let fsm ip state ~src ~dst data =
+    let has_data = Cstruct.length (snd (parse data)) > 0 in
+    let seq = Tcp_wire.get_sequence data in
+    match state with
+    | `SYN -> syn_ack ~window:0 ip ~src ~dst ~isn:1000000l data
+      >|= fun () -> Fsm_next (`PROBE (seq, 0))
+    | `PROBE _ when has_data -> Lwt.return (Fsm_error "sent data into a zero window")
+    | `PROBE (s, n) when seq = s ->  (* SND.NXT - 1: a probe *)
+      if n = 0 then Lwt.return (Fsm_next (`PROBE (s, 1)))
+      else
+        WIRE.xmit ~ip (reply_id_from ~src ~dst data) ~rx_ack:(Some (Sequence.of_int32 (Int32.succ s)))
+          ~seq:(Sequence.of_int32 1000001l) ~window:65535 ~options:[] Cstruct.empty
+        >|= Result.get_ok >|= fun () -> Fsm_next `DATA
+    | `DATA when has_data -> Lwt.return Fsm_done
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun flow ->
+      VNETIF_STACK.Stack.TCP.write flow (Cstruct.create 100) >|= fun _ -> ()))
+
+(* 13. A peer window permanently smaller than the MSS must not stall sending;
+   every segment must fit in the window. *)
+let small_window () =
+  let total = 300 and pwin = 100 in
+  let fsm ip state ~src ~dst data =
+    let _, payload = parse data in
+    let len = Cstruct.length payload in
+    match state with
+    | `SYN -> syn_ack ~window:pwin ip ~src ~dst ~isn:1000000l data
+      >|= fun () -> Fsm_next (`DATA 0)
+    | `DATA _ when len > pwin ->
+      Lwt.return (Fsm_error (Fmt.str "sent %d bytes into a %d byte window" len pwin))
+    | `DATA got when len > 0 ->
+      WIRE.xmit ~ip (reply_id_from ~src ~dst data) ~rx_ack:(ack data)
+        ~seq:(Sequence.of_int32 1000001l) ~window:pwin ~options:[] Cstruct.empty
+      >|= Result.get_ok >|= fun () ->
+      if got + len >= total then Fsm_done else Fsm_next (`DATA (got + len))
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun flow ->
+      VNETIF_STACK.Stack.TCP.write flow (Cstruct.create total) >|= fun _ -> ()))
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -327,5 +413,8 @@ let suite = [
   "new SYN replaces the half-open connection", `Quick, run_test "r10" (new_syn_replaces_half_open ());
   "wscale 14", `Quick, run_test "r5a" (wscale ~shift:14 ());
   "wscale > 14 is clamped to 14", `Quick, run_test "r5b" (wscale ~shift:16 ());
+  "receiver advertises and enforces a zero window", `Quick, run_test "r11" (zero_window_advertised ());
+  "persist timer probes a zero window", `Quick, run_test "r12" (zero_window_probe ());
+  "window smaller than MSS does not stall", `Quick, run_test "r13" (small_window ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
 ]

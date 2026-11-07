@@ -131,6 +131,24 @@ module Rx(ACK: Ack.M) = struct
     else
       `Drop
 
+  (* Cut off any data beyond the right edge of the advertised receive window
+     (RFC 9293 3.10.7.4: only the part inside the window is acceptable, and an
+     ACK must be sent for the rest).  With a zero window this drops all the
+     data, e.g. of a 1-byte zero window probe, and the forced ACK answers the
+     probe.  A FIN is only kept if all the data fits. *)
+  let trim_to_window q seg =
+    let edge = Window.rx_wnd_edge q.wnd in
+    let len = Cstruct.length seg.payload in
+    let allowed =
+      if Sequence.lt seg.header.sequence edge then
+        Sequence.to_int (Sequence.sub edge seg.header.sequence)
+      else 0
+    in
+    if len <= allowed then seg, false
+    else
+      { header = { seg.header with fin = false };
+        payload = Cstruct.sub seg.payload 0 (max 0 allowed) }, true
+
   let send_challenge_ack q =
     (* TODO:  rfc5961 ACK Throttling *)
     ACK.pushack q.ack Sequence.zero
@@ -141,9 +159,18 @@ module Rx(ACK: Ack.M) = struct
   let input (q:t) seg =
     match check_valid_segment q seg with
     | `Ok ->
-      let force_ack = ref false in
-      (* Insert the latest segment *)
-      let segs = S.add seg q.segs in
+      let seg, trimmed = trim_to_window q seg in
+      let force_ack = ref trimmed in
+      (* Only segments that occupy sequence space go into the reassembly set.
+         An empty one (pure ACK) stored there could shadow the real data
+         segment arriving later at the same sequence number.  An empty
+         segment with an old sequence number (e.g. a zero window probe or a
+         keep-alive, which use RCV.NXT - 1) must be answered with an ACK. *)
+      let occupies_seq_space = Cstruct.length seg.payload > 0 || seg.header.fin in
+      if not occupies_seq_space
+      && Sequence.lt seg.header.sequence (Window.rx_nxt_inseq q.wnd) then
+        force_ack := true;
+      let segs = if occupies_seq_space then S.add seg q.segs else q.segs in
       (* Walk through the set and get a list of contiguous segments *)
       let ready, waiting = S.fold (fun seg acc ->
           match Sequence.compare seg.header.sequence (Window.rx_nxt_inseq q.wnd) with
@@ -450,6 +477,14 @@ module Tx = struct
     q.xmit ~flags ~wnd ~options ~seq data >>= fun _ ->
     (* Inform the RX ack thread that we've just sent one *)
     Lwt_mvar.put q.rx_ack ack
+
+  (* A window probe: an empty segment with an old sequence number (SND.NXT - 1,
+     only sent when nothing is in flight), which the peer must answer with an
+     ACK carrying its current window. *)
+  let send_probe (T q) =
+    let seq = Sequence.pred (Window.tx_nxt q.wnd) in
+    q.xmit ~flags:No_flags ~wnd:q.wnd ~options:[] ~seq Cstruct.empty
+    >|= fun _ -> ()
 
   (* Retransmit the oldest unacknowledged segment right away, unchanged (same
      sequence number, flags and options).  Used to answer a retransmitted SYN

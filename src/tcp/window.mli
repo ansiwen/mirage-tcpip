@@ -46,7 +46,15 @@ val set_ack_seq_win : t -> Sequence.t -> int -> unit
 (* rx_wnd: number of bytes we are willing to accept *)
 val rx_wnd : t -> int32
 val rx_wnd_unscaled : t -> int32
+(** The receive window as advertised on the wire (scaled down, rounded up). *)
+
+val rx_wnd_edge : t -> Sequence.t
+(** The right edge of the advertised receive window: [rx_nxt] plus the
+    advertised window. Data beyond it is not accepted. *)
+
 val set_rx_wnd : t -> int32 -> unit
+(** [set_rx_wnd t sz] sets the receive window to [sz] (the free space in the
+    receive buffer), which may be 0. *)
 
 (* tx_wnd: number of bytes other side is willing to accept *)
 val tx_wnd : t -> int32
@@ -54,6 +62,13 @@ val tx_wnd_unscaled : t -> int32
 (* tx_available: number of bytes we can currently send after
                  accounting for congestion *)
 val tx_available : t -> int32
+
+val tx_usable : t -> int32
+(** [tx_usable t] is the number of bytes the send and congestion windows
+    allow us to send now. Unlike [tx_available] it is not rounded down to 0
+    below one MSS; sender-side silly window avoidance decides what to do with
+    a small window. *)
+
 (* tx_inflight: is there any data in flight *)
 val tx_inflight : t -> bool
 val set_tx_wnd : t -> int -> unit

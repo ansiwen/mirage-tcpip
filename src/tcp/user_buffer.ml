@@ -26,33 +26,55 @@ let lwt_sequence_add_l s seq =
    queue size changes *)
 module Rx = struct
 
- (* TODO: check that flow control works on the rx side - ie if the application
-    stops taking data the window closes so the other side stops sending *)
+  (* Flow control: the receive window advertised to the peer is the free
+     space in this buffer (minus [holdback], below).  [add_r] never blocks: a
+     peer that respects the window cannot overrun the buffer, and blocking here
+     would stop the receive thread from ACKing anything. *)
 
   type t = {
     q: Cstruct.t option Lwt_dllist.t;
     wnd: Window.t;
-    writers: unit Lwt.u Lwt_dllist.t;
     readers: Cstruct.t option Lwt.u Lwt_dllist.t;
     mutable watcher: int32 Lwt_mvar.t option;
     mutable max_size: int32;
     mutable cur_size: int32;
+    mutable holdback: int32;
+    (* Space freed by the application that is not advertised yet (receiver
+       silly window syndrome avoidance, RFC 1122 4.2.3.3): the right edge of
+       the window only moves once the freed space reaches [sws_threshold]. *)
+    on_window_update: unit -> unit Lwt.t;
+    (* Called (asynchronously) to send a window update ACK when a window that
+       was smaller than [sws_threshold] opens up again. *)
   }
 
-  let create ~max_size ~wnd =
+  let create ~max_size ~wnd ~on_window_update =
     let q = Lwt_dllist.create () in
-    let writers = Lwt_dllist.create () in
     let readers = Lwt_dllist.create () in
     let watcher = None in
     let cur_size = 0l in
-    { q; wnd; writers; readers; max_size; cur_size; watcher }
+    { q; wnd; readers; max_size; cur_size; watcher; holdback = 0l;
+      on_window_update }
 
-  let notify_size_watcher t =
-    let rx_wnd = max 0l (Int32.sub t.max_size t.cur_size) in
-    Window.set_rx_wnd t.wnd rx_wnd;
+  let sws_threshold t =
+    min (Int32.div t.max_size 2l) (Int32.of_int (Window.tx_mss t.wnd))
+
+  let update_window t =
+    let free = max 0l (Int32.sub t.max_size t.cur_size) in
+    t.holdback <- min t.holdback free;
+    Window.set_rx_wnd t.wnd (Int32.sub free t.holdback);
     match t.watcher with
-    |None   -> Lwt.return_unit
-    |Some w -> Lwt_mvar.put w t.cur_size
+    | None   -> ()
+    | Some w -> Lwt.async (fun () -> Lwt_mvar.put w t.cur_size)
+
+  (* The application consumed [len] bytes *)
+  let consumed t len =
+    let old_wnd = Window.rx_wnd t.wnd in
+    t.holdback <- Int32.add t.holdback (Int32.of_int len);
+    let threshold = sws_threshold t in
+    if t.holdback >= threshold then t.holdback <- 0l;
+    update_window t;
+    if old_wnd < threshold && Window.rx_wnd t.wnd >= threshold then
+      Lwt.async t.on_window_update
 
   let seglen s =
     match s with
@@ -64,26 +86,22 @@ module Rx = struct
       | 0 -> ()
       | n -> ignore (Lwt_dllist.take_l t.q); rm (pred n)
     in
-    rm (Lwt_dllist.length t.q)
+    rm (Lwt_dllist.length t.q);
+    t.cur_size <- 0l;
+    update_window t
 
   let add_r t s =
-    if t.cur_size > t.max_size then
-      let th,u = Lwt.wait () in
-      let node = Lwt_dllist.add_r u t.writers in
-      Lwt.on_cancel th (fun _ -> Lwt_dllist.remove node);
-      (* Update size before blocking, which may push cur_size above max_size *)
-      t.cur_size <- Int32.(add t.cur_size (of_int (seglen s)));
-      notify_size_watcher t >>= fun () ->
-      th >>= fun () ->
-      ignore(Lwt_dllist.add_r s t.q);
-      Lwt.return_unit
-    else match Lwt_dllist.take_opt_l t.readers with
+    begin match Lwt_dllist.take_opt_l t.readers with
       | None ->
         t.cur_size <- Int32.(add t.cur_size (of_int (seglen s)));
         ignore(Lwt_dllist.add_r s t.q);
-        notify_size_watcher t
+        update_window t
       | Some u ->
-        Lwt.return (Lwt.wakeup u s)
+        (* handed straight to a waiting reader: arrived and consumed *)
+        Lwt.wakeup u s;
+        consumed t (seglen s)
+    end;
+    Lwt.return_unit
 
   let take_l t =
     if Lwt_dllist.is_empty t.q then begin
@@ -94,12 +112,7 @@ module Rx = struct
     end else begin
       let s = Lwt_dllist.take_l t.q in
       t.cur_size <- Int32.(sub t.cur_size (of_int (seglen s)));
-      notify_size_watcher t >>= fun () ->
-      if t.cur_size < t.max_size then begin
-        match Lwt_dllist.take_opt_l t.writers with
-        |None -> ()
-        |Some w -> Lwt.wakeup w ()
-      end;
+      consumed t (seglen s);
       Lwt.return s
     end
 
@@ -127,13 +140,14 @@ module Tx = struct
     buffer: Cstruct.t Lwt_dllist.t;
     max_size: int32;
     mutable bufbytes: int32;
+    mutable persisting: bool; (* the persist timer is running *)
   }
 
   let create ~max_size ~wnd ~txq =
     let buffer = Lwt_dllist.create () in
     let writers = Lwt_dllist.create () in
     let bufbytes = 0l in
-    { wnd; writers; txq; buffer; max_size; bufbytes }
+    { wnd; writers; txq; buffer; max_size; bufbytes; persisting = false }
 
   let len data =
     Int32.of_int (Cstruct.length data)
@@ -183,7 +197,49 @@ module Tx = struct
       wait_for_flushed t
     end
 
-  let rec clear_buffer t =
+  (* How much buffered data may go out in the next segment.  Sender-side silly
+     window syndrome avoidance (RFC 1122 4.2.3.4): send a full segment if the
+     window allows it; otherwise only if all buffered data fits, or the usable
+     window is at least half the largest window the peer has offered.
+     [force] is the persist timer's override: send whatever fits. *)
+  let sendable_len ~force t =
+    let mss = Int32.of_int (Window.tx_mss t.wnd) in
+    let usable = Window.tx_usable t.wnd in
+    if usable >= mss then mss
+    else if usable > 0l
+         && (force || t.bufbytes <= usable
+             || usable >= Int32.div (Window.max_tx_wnd t.wnd) 2l)
+    then usable
+    else 0l
+
+  let max_persist_period = Duration.of_sec 60
+
+  (* The persist timer (RFC 9293 3.8.6.1): data is waiting, nothing is in
+     flight (so no ACK or retransmission timer will come), and the peer's
+     window is too small to send.  Probe the peer so that a lost window update
+     cannot stall the connection forever: with a zero window send a probe
+     (which the peer must answer with an ACK carrying its window), otherwise
+     send what fits.  Backs off exponentially and never gives up, as long as
+     the connection exists. *)
+  let rec persist t period =
+    Mirage_sleep.ns period >>= fun () ->
+    if Lwt_dllist.is_empty t.buffer || Window.tx_inflight t.wnd then begin
+      t.persisting <- false;
+      Lwt.return_unit
+    end else begin
+      (if Window.tx_usable t.wnd > 0l then clear_buffer ~force:true t
+       else TXS.send_probe t.txq) >>= fun () ->
+      persist t (min (Int64.mul 2L period) max_persist_period)
+    end
+
+  and start_persist t =
+    if not t.persisting && not (Lwt_dllist.is_empty t.buffer)
+       && not (Window.tx_inflight t.wnd) then begin
+      t.persisting <- true;
+      Lwt.async (fun () -> persist t (Window.rto t.wnd))
+    end
+
+  and clear_buffer ?(force=false) t =
     let rec addon_more curr_data l =
       match Lwt_dllist.take_opt_l t.buffer with
       | None -> List.rev curr_data
@@ -198,7 +254,7 @@ module Tx = struct
           addon_more (s::curr_data) (Int32.sub l s_len)
     in
     let get_pkt_to_send () =
-      let avail_len = min (available_cwnd t) (Int32.of_int (Window.tx_mss t.wnd)) in
+      let avail_len = sendable_len ~force t in
       let s = Lwt_dllist.take_l t.buffer in
       let s_len = len s in
       match s_len > avail_len with
@@ -227,7 +283,7 @@ module Tx = struct
     | true -> Lwt.return_unit
     | false ->
       match get_pkt_to_send () with
-      | None -> Lwt.return_unit
+      | None -> start_persist t; Lwt.return_unit
       | Some pkt ->
         let b = compactbufs pkt in
         TXS.output ~flags:Segment.Psh t.txq b >>= fun () ->
@@ -266,7 +322,9 @@ module Tx = struct
     | false ->
       t.bufbytes <- Int32.add t.bufbytes l;
       List.iter (fun data -> ignore(Lwt_dllist.add_r data t.buffer)) datav;
-      if t.bufbytes < mss then
+      (* Nagle: hold back a small segment while data is unacknowledged (its
+         ACK will flush the buffer); otherwise try to send now *)
+      if t.bufbytes < mss && Window.tx_inflight t.wnd then
         Lwt.return_unit
       else
         clear_buffer t
@@ -276,7 +334,7 @@ module Tx = struct
       | true ->
         t.bufbytes <- Int32.add t.bufbytes l;
         List.iter (fun data -> ignore(Lwt_dllist.add_r data t.buffer)) datav;
-        Lwt.return_unit
+        clear_buffer t
       | false ->
         let max_size = Window.tx_mss t.wnd in
         transmit_segments ~mss:max_size ~txq:t.txq datav
@@ -287,14 +345,14 @@ module Tx = struct
     | false ->
       t.bufbytes <- Int32.add t.bufbytes l;
       List.iter (fun data -> ignore(Lwt_dllist.add_r data t.buffer)) datav;
-      Lwt.return_unit
+      clear_buffer t
     | true ->
       let avail_len = available_cwnd t in
       match avail_len < l with
       | true ->
         t.bufbytes <- Int32.add t.bufbytes l;
         List.iter (fun data -> ignore(Lwt_dllist.add_r data t.buffer)) datav;
-        Lwt.return_unit
+        clear_buffer t
       | false ->
         let max_size = Window.tx_mss t.wnd in
         transmit_segments ~mss:max_size ~txq:t.txq datav

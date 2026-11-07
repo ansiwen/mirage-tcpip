@@ -82,6 +82,11 @@ module Tx : sig
       The transmitter should check that the segment size will not
       be greater than the transmit window.  *)
 
+  val send_probe: t -> unit Lwt.t
+  (** [send_probe t] sends a zero window probe: an empty segment with sequence
+      number SND.NXT - 1, which the peer answers with an ACK carrying its
+      current window. Only meaningful when no data is in flight. *)
+
   val retransmit_head: t -> unit Lwt.t
   (** [retransmit_head t] immediately resends the oldest unacknowledged
       segment unchanged (same sequence number, flags and options). Does nothing

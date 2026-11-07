@@ -76,7 +76,8 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
   let fast_rec_th = tx_nxt in
   let ack_serviced = true in
   let ack_seq = tx_nxt in
-  let ack_win = rx_wnd in
+  (* last window received from the peer (unscaled), to detect window updates *)
+  let ack_win = tx_wnd in
   let rx_wnd = Int32.(shift_left (of_int rx_wnd) rx_wnd_scale) in
   let max_rx_wnd = rx_wnd in
   let tx_wnd = Int32.(shift_left (of_int tx_wnd) tx_wnd_scale) in
@@ -123,7 +124,16 @@ let rx_advance_inseq t b =
 let rx_nxt t = t.rx_nxt
 let rx_nxt_inseq t = t.rx_nxt_inseq
 let rx_wnd t = t.rx_wnd
-let rx_wnd_unscaled t = Int32.shift_right t.rx_wnd t.rx_wnd_scale
+(* Rounded up, so that the advertised right edge never moves left as data
+   arrives (rounding down would shrink it by up to 2^scale - 1 bytes). *)
+let rx_wnd_unscaled t =
+  let round = Int32.(pred (shift_left 1l t.rx_wnd_scale)) in
+  Int32.shift_right (Int32.add t.rx_wnd round) t.rx_wnd_scale
+
+(* Right edge of the window as advertised on the wire *)
+let rx_wnd_edge t =
+  Sequence.add t.rx_nxt
+    (Sequence.of_int32 (Int32.shift_left (rx_wnd_unscaled t) t.rx_wnd_scale))
 
 let ack_serviced t = t.ack_serviced
 let ack_seq t = t.ack_seq
@@ -134,10 +144,10 @@ let set_ack_seq_win t s w =
   t.ack_seq <- s;
   t.ack_win <- w
 
-(* TODO: scale the window down so we can advertise it correctly with
-   window scaling on the wire *)
+(* The receive window is the free space in the application receive buffer.
+   It may be 0: that is how the peer is told to stop sending. *)
 let set_rx_wnd t sz =
-  t.rx_wnd <- max sz (Int32.of_int (3 * t.tx_mss + 1 lsl t.rx_wnd_scale))
+  t.rx_wnd <- max 0l (min sz t.max_rx_wnd)
 
 (* Take an unscaled value and scale it up *)
 let set_tx_wnd t sz =
@@ -216,6 +226,10 @@ let tx_available t =
   match avail_win < Int32.of_int t.tx_mss with
   | true -> 0l
   | false -> avail_win
+
+let tx_usable t =
+  let inflight = Sequence.to_int32 (Sequence.sub t.tx_nxt t.snd_una) in
+  max 0l (Int32.sub (min t.cwnd t.tx_wnd) inflight)
 
 let tx_inflight t =
   t.tx_nxt <> t.snd_una
