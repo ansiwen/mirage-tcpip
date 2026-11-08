@@ -88,7 +88,7 @@ type 'state fsm_result =
 (*  This could be moved to a common module and reused for other low level tcp tests *)
 
 (* setups network and run a given sut and raw fsm *)
-let run backend fsm sut () =
+let run ?(timeout=5) backend fsm sut () =
   let initial_state, fsm_handler = fsm in
   create_sut_stack backend >>= fun stack ->
   create_raw_stack backend >>= fun (netif, ethif, arp, rawip) ->
@@ -128,7 +128,7 @@ let run backend fsm sut () =
 
   (* Either both fsm and the sut terminates, or a timeout occurs, or one of the sut/fsm informs an error *)
   Lwt.pick [
-    (Mirage_sleep.ns (Duration.of_sec 5) >>= fun () ->
+    (Mirage_sleep.ns (Duration.of_sec timeout) >>= fun () ->
      Lwt.return_some "timed out");
 
     (Lwt.join [

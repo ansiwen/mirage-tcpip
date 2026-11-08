@@ -97,7 +97,11 @@ let pp_tcpstate fmt = function
 let pp fmt t = pf fmt "{ %a }" pp_tcpstate t.state
 
 let fin_wait_2_time = (* 60 *) Duration.of_sec 10
-let time_wait_time = (* 30 *) Duration.of_sec 2
+(* 2 * MSL.  RFC 9293 suggests an MSL of 2 minutes; like Linux we use 60
+   seconds for the whole TIME-WAIT period.  A new SYN for a connection in
+   TIME-WAIT is accepted (see [Flow.input]), so this does not block peers that
+   reuse their port. *)
+let time_wait_time = Duration.of_sec 60
 
 let rec finwait2timer t count timeout =
   Log.debug (fun fmt -> fmt "finwait2timer %Lu" timeout);

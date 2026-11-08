@@ -7,9 +7,10 @@ let fresh_window () =
   Alcotest.(check bool) "no rexmits yet" false @@ Tcp.Window.max_rexmits_done window;
   Alcotest.(check int) "no traffic transferred yet" 0 @@ Tcp.Window.tx_totalbytes window;
   Alcotest.(check int) "no traffic received yet" 0 @@ Tcp.Window.rx_totalbytes window;
-  Alcotest.(check int32) "should be able to send 65535 <<= 2 bytes" Int32.(mul 65535l 4l) @@ Tcp.Window.tx_wnd window;
+  (* the window advertised in a SYN is never scaled (RFC 7323 2.2) *)
+  Alcotest.(check int32) "should be able to send 65535 bytes before the first ACK" 65535l @@ Tcp.Window.tx_wnd window;
   Alcotest.(check int32) "should be able to receive 65535 <<= 2 bytes" Int32.(mul 65535l 4l) @@ Tcp.Window.rx_wnd window;
-  Alcotest.(check int64) "initial rto is 2/3 second" (Duration.of_ms 667) @@ Tcp.Window.rto window;
+  Alcotest.(check int64) "initial rto is 1 second (RFC 6298 2.1)" (Duration.of_sec 1) @@ Tcp.Window.rto window;
   Lwt.return_unit
 
 (* Congestion control, RFC 5681 / RFC 6582.  The default window has a
@@ -103,10 +104,40 @@ let rto_backoff () =
   Alcotest.(check int64) "capped at 60 seconds" (Duration.of_sec 60) (Tcp.Window.rto w);
   Lwt.return_unit
 
+let rto_rfc6298 () =
+  let w = default_window () in
+  send w (segs 1);
+  Mirage_mtime_set.tick_for (Duration.of_ms 10);
+  ack_more w (segs 1);
+  Alcotest.(check int64) "RTO is at least 1 second (RFC 6298 2.4)"
+    (Duration.of_sec 1) (Tcp.Window.rto w);
+  (* RFC 6298 5.7: a retransmitted SYN-ACK raises the RTO to 3s once ACKed *)
+  let w = default_window () in
+  send w 1l;  (* the SYN-ACK *)
+  Tcp.Window.on_syn_retransmit w;
+  Tcp.Window.on_rto w;
+  Tcp.Window.backoff_rto w;
+  ack_more w 1l;
+  Alcotest.(check int64) "RTO 3s after a retransmitted SYN-ACK"
+    (Duration.of_sec 3) (Tcp.Window.rto w);
+  check_cwnd "initial window one segment after a lost SYN-ACK" mss w;
+  let w = default_window () in
+  Tcp.Window.handshake_retransmitted w;
+  Alcotest.(check int64) "RTO 3s after a retransmitted SYN"
+    (Duration.of_sec 3) (Tcp.Window.rto w);
+  check_cwnd "initial window one segment after a lost SYN" mss w;
+  Lwt.return_unit
+
+let initial_ssthresh () =
+  let w = default_window () in
+  Alcotest.(check int32) "initial ssthresh is the largest possible window"
+    (Int32.shift_left 65535l 14) (Tcp.Window.ssthresh w);
+  Lwt.return_unit
+
 let rto_calculation () =
   let window = default_window () in
   (* RFC 2988 2.1 *)
-  Alcotest.(check int64) "initial rto is 2/3 second" (Duration.of_ms 667) @@ Tcp.Window.rto window;
+  Alcotest.(check int64) "initial rto is 1 second (RFC 6298 2.1)" (Duration.of_sec 1) @@ Tcp.Window.rto window;
   let receive_window = Tcp.Window.ack_win window in
   Tcp.Window.tx_advance window (Tcp.Window.tx_nxt window);
   Mirage_mtime_set.tick_for (Duration.of_ms 400);
@@ -134,6 +165,8 @@ let suite = [
   "fast recovery (RFC 5681, RFC 6582)", `Quick, fast_recovery;
   "retransmission timeout resets cwnd (RFC 5681 3.1)", `Quick, retransmission_timeout;
   "RTO backoff doubles and is capped", `Quick, rto_backoff;
+  "RTO minimum and 3s rule (RFC 6298)", `Quick, rto_rfc6298;
+  "initial ssthresh", `Quick, initial_ssthresh;
   "smoothed rtt, rtt variation and retransmission timer are calculated according to RFC2988", `Quick, rto_calculation;
 ]
 

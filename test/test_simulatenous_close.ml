@@ -41,7 +41,8 @@ let close_ack_scenario =
     or_error "connect" conn (Ipaddr.V4 server_ip, 80) >>= fun flow ->
     (* We should receive the data *)
     VNETIF_STACK.Stack.TCP.close flow >>= fun () ->
-    Lwt_unix.sleep 4.0 >>= fun () ->
+    (* a simultaneous close ends in TIME-WAIT (RFC 9293), which lasts 60s *)
+    Lwt_unix.sleep 62.0 >>= fun () ->
     Alcotest.(check int) "connection is cleaned" 0 (VNETIF_STACK.T.num_open_channels ((VNETIF_STACK.Stack.tcp stack)));
     Lwt.return_unit
   in
@@ -101,11 +102,11 @@ let close_ack_scenario =
     in
     (`WAIT_FOR_SYN, fsm), sut
 
-let run_test pcap_file ((initial_state, fsm), sut) () =
+let run_test ?timeout pcap_file ((initial_state, fsm), sut) () =
   let backend = VNETIF_STACK.create_backend () in
-  VNETIF_STACK.record_pcap backend pcap_file  (run backend (initial_state, fsm) sut)
+  VNETIF_STACK.record_pcap backend pcap_file  (run ?timeout backend (initial_state, fsm) sut)
 
 let suite = [
-  "close with ack", `Slow, run_test "close_ack.pcap" close_ack_scenario;
+  "close with ack", `Slow, run_test ~timeout:70 "close_ack.pcap" close_ack_scenario;
   "close with reset, challenge ack ok", `Slow, run_test "close_reset.pcap" close_reset_scenario;
 ]

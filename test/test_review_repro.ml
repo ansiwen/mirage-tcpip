@@ -518,7 +518,7 @@ let syn_backlog () =
     Mirage_sleep.ns (Duration.of_ms 2500) >|= fun () ->
     Alcotest.(check int) "SYN-ACKs sent (backlog limit 1024)" 1024 (Hashtbl.length synacks)
   in
-  `Long_kick (5, (`ANY, fsm), sut, kick)
+  `Long_kick (5, false, (`ANY, fsm), sut, kick)
 
 (* ---- Segment acceptance (RFC 9293 3.10.7.4, RFC 5961) ---- *)
 
@@ -573,7 +573,7 @@ let invalid_ack_rate_limit () =
     sut_connects_then (fun _ -> Lwt.return_unit) stack >|= fun () ->
     Alcotest.(check int) "one ACK for 5 out-of-window segments" 1 !acks
   in
-  `Long_kick (5, (`SYN, fsm), sut, no_kick)
+  `Long_kick (5, false, (`SYN, fsm), sut, no_kick)
 
 (* 24. a segment without the ACK flag is ignored in ESTABLISHED *)
 let no_ack_flag_dropped () =
@@ -643,6 +643,86 @@ let ooo_bounded () =
   in
   `Client ((`SYN, fsm), sut_connects_then (fun _ -> Lwt.return_unit))
 
+(* ---- Windows and timers ---- *)
+
+(* 28. without an MSS option the peer gets segments of at most 536 bytes *)
+let default_mss () =
+  let fsm ip state ~src ~dst data =
+    let len = Cstruct.length (snd (parse data)) in
+    match state with
+    | `SYN -> syn_ack ~options:[] ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `DATA
+    | `DATA when len > 536 ->
+      Lwt.return (Fsm_error (Fmt.str "sent a %d byte segment without an MSS option" len))
+    | `DATA when len > 0 -> Lwt.return Fsm_done
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun flow ->
+      VNETIF_STACK.Stack.TCP.write flow (Cstruct.create 2000) >|= fun _ -> ()))
+
+(* 29. the SYN is retransmitted after the initial RTO of 1 second, and after
+   such a retransmission the first data RTO is 3 seconds (RFC 6298 5.7) *)
+let syn_rto () =
+  let t0 = ref 0. in
+  let fsm ip state ~src ~dst data =
+    let now = Unix.gettimeofday () in
+    let len = Cstruct.length (snd (parse data)) in
+    match state with
+    | `SYN1 -> t0 := now; Lwt.return (Fsm_next `SYN2)   (* "lose" the SYN *)
+    | `SYN2 when Tcp_wire.get_syn data ->
+      let dt = now -. !t0 in
+      if dt > 1.5 then Lwt.return (Fsm_error (Fmt.str "SYN retransmitted after %.1fs" dt))
+      else syn_ack ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `DATA
+    | `DATA when len > 0 -> t0 := now; Lwt.return (Fsm_next `REXMIT)  (* never ACKed *)
+    | `REXMIT when len > 0 ->
+      let dt = now -. !t0 in
+      if dt < 2.5 then Lwt.return (Fsm_error (Fmt.str "data RTO %.1fs after a SYN retransmission" dt))
+      else Lwt.return Fsm_done
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Long_kick (12, true, (`SYN1, fsm), sut_connects_then (fun flow ->
+      VNETIF_STACK.Stack.TCP.write flow (Cstruct.create 100) >>= fun _ ->
+      Mirage_sleep.ns (Duration.of_sec 4)), no_kick)
+
+(* 30. TIME-WAIT lasts long enough to re-ACK a retransmitted FIN 3 seconds
+   later, and a new SYN with a higher sequence number reopens the connection *)
+let time_wait () =
+  let fsm ip state ~src:_ ~dst:_ data =
+    let syn = Tcp_wire.get_syn data and fin = Tcp_wire.get_fin data in
+    let seq = Tcp_wire.get_sequence data and ackn = Tcp_wire.get_ack_number data in
+    match state with
+    | `SYNACK when syn ->
+      xmit_client ip ~seq:(Int32.succ client_isn) ~ack:(Some (Int32.succ seq))
+      >|= fun () -> Fsm_next `FIN
+    | `FIN when fin ->
+      (* ACK the server's FIN and send ours: the server enters TIME-WAIT *)
+      WIRE.xmit ~ip client_id ~fin:true ~rx_ack:(Some (Sequence.of_int32 (Int32.succ seq)))
+        ~seq:(Sequence.of_int32 (Int32.succ client_isn)) ~window:65535 ~options:[] Cstruct.empty
+      >|= Result.get_ok >|= fun () -> Fsm_next (`FINACK (Int32.succ seq))
+    | `FINACK a when ackn = Int32.add client_isn 2l ->
+      Mirage_sleep.ns (Duration.of_sec 3) >>= fun () ->
+      (* our FIN again, as if the ACK had been lost *)
+      WIRE.xmit ~ip client_id ~fin:true ~rx_ack:(Some (Sequence.of_int32 a))
+        ~seq:(Sequence.of_int32 (Int32.succ client_isn)) ~window:65535 ~options:[] Cstruct.empty
+      >|= Result.get_ok >|= fun () -> Fsm_next `REACK
+    | `REACK when Tcp_wire.get_rst data ->
+      Lwt.return (Fsm_error "retransmitted FIN answered with RST: TIME-WAIT too short")
+    | `REACK when ackn = Int32.add client_isn 2l ->
+      WIRE.xmit ~ip client_id ~syn:true ~rx_ack:None
+        ~seq:(Sequence.of_int32 (Int32.add client_isn 100000l)) ~window:65535
+        ~options:[] Cstruct.empty >|= Result.get_ok >|= fun () -> Fsm_next `NEWSYN
+    | `NEWSYN when syn && Tcp_wire.get_ack data
+                   && ackn = Int32.add client_isn 100001l -> Lwt.return Fsm_done
+    | `NEWSYN when not syn && not (Tcp_wire.get_rst data) && ackn = Int32.add client_isn 2l ->
+      Lwt.return (Fsm_error "new SYN in TIME-WAIT was not accepted")
+    | s -> Lwt.return (Fsm_next s)
+  in
+  let sut stack =
+    VNETIF_STACK.Stack.TCP.listen (VNETIF_STACK.Stack.tcp stack) ~port:80
+      (fun flow -> VNETIF_STACK.Stack.TCP.close flow);
+    Mirage_sleep.ns (Duration.of_sec 6)
+  in
+  `Long_kick (10, true, (`SYNACK, fsm), sut, (fun ip -> send_client_syn ip))
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -654,9 +734,9 @@ let run_test name = function
   | `Long (cap, fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
     VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap backend ~kick:no_kick fsm sut)
-  | `Long_kick (cap, fsm, sut, kick) -> fun () ->
+  | `Long_kick (cap, wait_fsm, fsm, sut, kick) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
-    VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap ~wait_fsm:false backend ~kick fsm sut)
+    VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap ~wait_fsm backend ~kick fsm sut)
 
 let suite = [
   "fast retransmit uses the segment's own seq", `Quick, run_test "r6" (fast_rexmit_alignment ());
@@ -687,5 +767,8 @@ let suite = [
   "stale segment does not update the window", `Quick, run_test "r25" (stale_window_update ());
   "longer same-seq out-of-order segment is kept", `Quick, run_test "r26" (ooo_same_seq_longer ());
   "out-of-order queue is bounded", `Quick, run_test "r27" (ooo_bounded ());
+  "no MSS option means 536 bytes", `Quick, run_test "r28" (default_mss ());
+  "SYN RTO 1s, then 3s data RTO", `Quick, run_test "r29" (syn_rto ());
+  "TIME-WAIT re-ACKs FIN and accepts a new SYN", `Quick, run_test "r30" (time_wait ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
 ]

@@ -60,7 +60,17 @@ type t = {
   mutable rttvar: time;
   mutable rto: int64;
   mutable backoff_count: int;
+  mutable syn_retransmitted: bool; (* our SYN-ACK had to be retransmitted *)
 }
+
+(* The largest window that can be advertised (65535 << 14, RFC 7323), used
+   as the initial "arbitrarily high" ssthresh (RFC 5681 3.1) and as a cap on
+   cwnd so it cannot overflow. *)
+let max_window = Int32.shift_left 65535l 14
+
+(* RFC 6298 2.1, 2.4: initial RTO 1 second, and no computed RTO below 1 s *)
+let initial_rto = Duration.of_sec 1
+let min_rto = Duration.of_sec 1
 
 (* To string for debugging *)
 let pp fmt t =
@@ -87,11 +97,12 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
   let snd_wl1 = rx_isn and snd_wl2 = tx_isn in
   let rx_wnd = Int32.(shift_left (of_int rx_wnd) rx_wnd_scale) in
   let max_rx_wnd = rx_wnd in
-  let tx_wnd = Int32.(shift_left (of_int tx_wnd) tx_wnd_scale) in
+  (* the window in a SYN or SYN-ACK is never scaled (RFC 7323 2.2) *)
+  let tx_wnd = Int32.of_int tx_wnd in
   let max_tx_wnd = tx_wnd in
-  (* ssthresh is initialized per RFC 2581 to a large value so slow-start
+  (* ssthresh is initialized per RFC 5681 to a large value so slow-start
      can be used all the way till first loss *)
-  let ssthresh = tx_wnd in
+  let ssthresh = max_window in
   let cwnd = Int32.of_int (tx_mss * 2) in
   let fast_recovery = false in
   let rto_recovery = false in
@@ -99,17 +110,19 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
   let rtt_timer_reset = true in
   let rtt_timer_seq = tx_nxt in
   let rtt_timer_starttime = 0L in
-  let srtt = (Duration.of_ms 667) in
+  let srtt = initial_rto in
   let rttvar = 0L in
-  let rto = (Duration.of_ms 667) in
+  let rto = initial_rto in
   let backoff_count = 0 in
+  let syn_retransmitted = false in
   { tx_isn; rx_isn; max_rx_wnd; max_tx_wnd;
     ack_serviced; ack_seq; ack_win; snd_wl1; snd_wl2;
     snd_una; tx_nxt; tx_wnd; rx_nxt; rx_nxt_inseq;
     fast_rec_th; rx_wnd; tx_wnd_scale; rx_wnd_scale;
     ssthresh; cwnd; tx_mss; fast_recovery; rto_recovery;
     rtt_timer_on; rtt_timer_reset;
-    rtt_timer_seq; rtt_timer_starttime; srtt; rttvar; rto; backoff_count }
+    rtt_timer_seq; rtt_timer_starttime; srtt; rttvar; rto; backoff_count;
+    syn_retransmitted }
 
 (* Check if a sequence number is in the right range *)
 let valid t seq =
@@ -197,7 +210,7 @@ let grow_cwnd t acked =
     if t.cwnd < t.ssthresh then min acked (mss t)
     else max (Int32.div (Int32.mul (mss t) (mss t)) t.cwnd) 1l
   in
-  t.cwnd <- Int32.add t.cwnd incr
+  t.cwnd <- min max_window (Int32.add t.cwnd incr)
 
 let rtt_sample t =
   t.rtt_timer_on <- false;
@@ -216,7 +229,7 @@ let rtt_sample t =
     t.rttvar <- (3L * t.rttvar / 4L) + (Int64.abs (t.srtt - rtt_m) / 4L);
     t.srtt <- (7L * t.srtt / 8L) + (rtt_m / 8L)
   end;
-  t.rto <- max (Duration.of_ms 667) Int64.(add t.srtt (mul t.rttvar 4L))
+  t.rto <- max min_rto Int64.(add t.srtt (mul t.rttvar 4L))
 
 (* An ACK was received - use it to adjust cwnd.  Only ACKs of new data grow
    the window; in fast recovery duplicate ACKs inflate it and partial ACKs
@@ -230,6 +243,12 @@ let tx_ack t r win =
   if acked > 0l then begin
     t.backoff_count <- 0;
     t.snd_una <- r;
+    if t.syn_retransmitted then begin
+      (* RFC 6298 5.7: the SYN-ACK was retransmitted, so use an RTO of at
+         least 3 seconds once data transmission begins *)
+      t.syn_retransmitted <- false;
+      t.rto <- max t.rto (Duration.of_sec 3)
+    end;
     (* Karn: the timer is off while retransmitted data is outstanding *)
     if t.rtt_timer_on && Sequence.gt r t.rtt_timer_seq then rtt_sample t
   end;
@@ -250,7 +269,7 @@ let tx_ack t r win =
              (if acked >= mss t then mss t else 0l))
     else
       (* duplicate ACK: one more segment has left the network *)
-      t.cwnd <- Int32.add t.cwnd (mss t)
+      t.cwnd <- min max_window (Int32.add t.cwnd (mss t))
   end else if acked > 0l then
     grow_cwnd t acked
 
@@ -310,6 +329,16 @@ let on_rto t =
   t.rto_recovery <- true;
   t.fast_rec_th <- t.tx_nxt;
   t.rtt_timer_on <- false
+
+(* Our SYN-ACK is being retransmitted (RFC 6298 5.7, see [tx_ack]) *)
+let on_syn_retransmit t = t.syn_retransmitted <- true
+
+(* The handshake of an active open needed a SYN retransmission: start with
+   an RTO of 3 seconds (RFC 6298 5.7) and a one-segment initial window
+   (RFC 5681 3.1). *)
+let handshake_retransmitted t =
+  t.rto <- max t.rto (Duration.of_sec 3);
+  t.cwnd <- mss t
 
 let cwnd t = t.cwnd
 let ssthresh t = t.ssthresh

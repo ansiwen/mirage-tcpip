@@ -71,7 +71,8 @@ struct
     listens: (WIRE.t, (Sequence.t * ((flow -> unit Lwt.t) * connection)))
         Hashtbl.t;
     (* clients in the process of connecting *)
-    connects: (WIRE.t, ((connection, error) result Lwt.u * Sequence.t * Tcpip.Tcp.Keepalive.t option)) Hashtbl.t;
+    connects: (WIRE.t, ((connection, error) result Lwt.u * Sequence.t * Tcpip.Tcp.Keepalive.t option * bool ref)) Hashtbl.t;
+    (* the [bool ref] records whether the SYN had to be retransmitted *)
   }
 
   let num_open_channels t = Hashtbl.length t.channels
@@ -267,11 +268,6 @@ struct
 
   end
 
-  (* Helper function to apply function with contents of hashtbl, or
-     take default action *)
-  let with_hashtbl h k fn default =
-    try fn (Hashtbl.find h k) with Not_found -> default k
-
   let hashtbl_find h k =
     try Some (Hashtbl.find h k) with Not_found -> None
 
@@ -368,11 +364,19 @@ struct
     let { tx_wnd; sequence; options; tx_isn; rx_wnd; rx_wnd_scaleoffer } =
       params
     in
+    (* Without an MSS option the peer must be assumed to accept 536 bytes
+       (IPv4) or 1220 bytes (IPv6) (RFC 9293 3.7.1, MUST-15).  The address
+       family is told apart by the size of the TCP pseudo-header (12 bytes for
+       IPv4, 40 for IPv6), as [Ip.ipaddr] is abstract. *)
+    let default_mss =
+      let ph = Ip.pseudoheader t.ip ~src:(WIRE.src id) (WIRE.dst id) `TCP 0 in
+      if Cstruct.length ph > 12 then 1220 else 536
+    in
     let tx_mss = List.fold_left (fun a ->
       function
       | Options.MSS m -> min m mtu_mss
       | _ -> a
-    ) mtu_mss options
+    ) (min default_mss mtu_mss) options
     in
     let (rx_wnd_scale, tx_wnd_scale), opts =
       resolve_wnd_scaling options rx_wnd_scaleoffer
@@ -500,7 +504,7 @@ struct
   let process_reset t id (h : Tcp_packet.t) =
     log_with_stats "process-reset" t;
     match hashtbl_find t.connects id with
-    | Some (wakener, tx_isn, _) ->
+    | Some (wakener, tx_isn, _, _) ->
       (* SYN-SENT: the RST is acceptable only if it acknowledges our SYN *)
       if h.ack && is_correct_ack ~tx_isn ~ack_number:h.ack_number then begin
         Hashtbl.remove t.connects id;
@@ -530,7 +534,7 @@ struct
   let process_synack t id (h : Tcp_packet.t) ~payload_len =
     log_with_stats "process-synack" t;
     match hashtbl_find t.connects id with
-    | Some (wakener, tx_isn, keepalive) ->
+    | Some (wakener, tx_isn, keepalive, syn_retransmitted) ->
       if is_correct_ack ~tx_isn ~ack_number:h.ack_number then (
         Hashtbl.remove t.connects id;
         Stats.decr_connect ();
@@ -543,6 +547,7 @@ struct
             tx_isn; rx_wnd; rx_wnd_scaleoffer }
           id h.ack_number keepalive
         >>= fun (pcb, th) ->
+        if !syn_retransmitted then Window.handshake_retransmitted pcb.wnd;
         Lwt.wakeup wakener (Ok (pcb, th));
         Lwt.return_unit
       ) else
@@ -615,7 +620,7 @@ struct
         Tx.send_rst t id pkt.header ~payload_len
     | None ->
       match hashtbl_find t.connects id with
-      | Some (_, tx_isn, _) ->
+      | Some (_, tx_isn, _, _) ->
         (* SYN-SENT: an acceptable ACK without SYN is dropped, an
            unacceptable one is reset (RFC 9293 3.10.7.3) *)
         if is_correct_ack ~tx_isn ~ack_number:pkt.header.ack_number
@@ -657,11 +662,23 @@ struct
         WIRE.v ~src_port:pkt.dst_port ~dst_port:pkt.src_port ~dst:src ~src:dst
       in
       (* Lookup connection from the active PCB hash *)
-      with_hashtbl t.channels id
+      match hashtbl_find t.channels id with
+      | Some (pcb, _) when pkt.syn && not pkt.ack && not pkt.rst
+                           && State.state pcb.state = State.Time_wait
+                           && Sequence.gt pkt.sequence (Window.rx_nxt pcb.wnd) ->
+        (* RFC 1122 4.2.2.13: a new SYN with a higher sequence number may
+           reopen a connection that is in TIME-WAIT.  The old connection's
+           TIME-WAIT timer will not remove the new one (see [clearpcb]). *)
+        Log.debug (fun f -> f "new SYN on %a in TIME-WAIT, reopening" WIRE.pp id);
+        Hashtbl.remove t.channels id;
+        Stats.decr_channel ();
+        input_no_pcb t (pkt, payload) id
+      | Some conn ->
         (* PCB exists, so continue the connection state machine in tcp_input *)
-        (Rx.input t RXS.({header = pkt; payload}))
+        Rx.input t RXS.({header = pkt; payload}) conn
+      | None ->
         (* No existing PCB, so check if it is a SYN for a listening function *)
-        (input_no_pcb t (pkt, payload))
+        input_no_pcb t (pkt, payload) id
 
   (* Blocking read on a PCB *)
   let read pcb =
@@ -757,22 +774,25 @@ struct
     in
     probe 0
 
-  (* SYN retransmission timer *)
+  (* SYN retransmission timer: RFC 6298 initial RTO of 1 second, doubled for
+     each retransmission (1, 2, 4, 8, 16 s); the connection attempt fails 32 s
+     after the 5th retransmission, about 63 s after the first SYN. *)
+  let max_syn_retransmits = 5
+
   let rec connecttimer t id tx_isn options window count =
-    let rxtime = match count with
-      | 0 -> 3 | 1 -> 6 | 2 -> 12 | 3 -> 24 | _ -> 48
-    in
+    let rxtime = 1 lsl count in
     Mirage_sleep.ns (Duration.of_sec rxtime) >>= fun () ->
     match hashtbl_find t.connects id with
     | None                -> Lwt.return_unit
-    | Some (wakener, isn, _) ->
+    | Some (wakener, isn, _, syn_retransmitted) ->
       if isn = tx_isn then
-        if count > 3 then (
+        if count >= max_syn_retransmits then (
           Hashtbl.remove t.connects id;
           Stats.decr_connect ();
           Lwt.wakeup wakener (Error `Timeout);
           Lwt.return_unit
         ) else (
+          syn_retransmitted := true;
           Tx.send_syn t id ~tx_isn ~options ~window >>= function
           | Ok () -> connecttimer t id tx_isn options window (count + 1)
           | Error (`No_route _s) ->
@@ -812,7 +832,7 @@ struct
       Hashtbl.remove t.connects id;
       Stats.decr_connect ();
     );
-    Hashtbl.add t.connects id (wakener, tx_isn, keepalive);
+    Hashtbl.add t.connects id (wakener, tx_isn, keepalive, ref false);
     Stats.incr_connect ();
     Tx.send_syn t id ~tx_isn ~options ~window >>= function
     | Ok () | Error _ (* keep trying *) ->

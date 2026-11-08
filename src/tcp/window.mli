@@ -90,6 +90,15 @@ val on_rto : t -> unit
     timer (RFC 5681 3.1): ssthresh is halved, cwnd restarts at one segment and
     loss recovery is entered. Call it before [backoff_rto]. *)
 
+val on_syn_retransmit : t -> unit
+(** [on_syn_retransmit t] records that our SYN-ACK was retransmitted, so that
+    the RTO is raised to 3 seconds once it is acknowledged (RFC 6298 5.7). *)
+
+val handshake_retransmitted : t -> unit
+(** [handshake_retransmitted t] is called when an active open needed SYN
+    retransmissions: the RTO becomes at least 3 seconds (RFC 6298 5.7) and the
+    initial window one segment (RFC 5681 3.1). *)
+
 val cwnd : t -> int32
 (** The congestion window, in bytes. *)
 
