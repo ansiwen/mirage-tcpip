@@ -26,7 +26,7 @@ sig
   val create_backend : unit -> backend
 
   (** Create a new stack connected to an existing backend *)
-  val create_stack : ?mtu:int -> cidr:Ipaddr.V4.Prefix.t ->
+  val create_stack : ?mtu:int -> ?tcp_verify_checksums:bool -> cidr:Ipaddr.V4.Prefix.t ->
     ?gateway:Ipaddr.V4.t -> ?cidr6:Ipaddr.V6.Prefix.t ->
     ?gateway6:Ipaddr.V6.t -> backend -> Stack.t Lwt.t
 
@@ -66,7 +66,7 @@ end
   let create_backend () =
     B.create ()
 
-  let create_stack ?mtu ~cidr ?gateway ?cidr6 ?gateway6 backend =
+  let create_stack ?mtu ?tcp_verify_checksums ~cidr ?gateway ?cidr6 ?gateway6 backend =
     let size_limit = match mtu with None -> None | Some x -> Some x in
     V.connect ?size_limit backend >>= fun netif ->
     E.connect netif >>= fun ethif ->
@@ -76,7 +76,7 @@ end
     Ip6.connect ?cidr:cidr6 ?gateway:gateway6 netif ethif >>= fun ipv6 ->
     Ip46.connect ~ipv4_only:false ~ipv6_only:false ipv4 ipv6 >>= fun ip ->
     U.connect ip >>= fun udp ->
-    T.connect ip >>= fun tcp ->
+    T.connect ?verify_checksums:tcp_verify_checksums ip >>= fun tcp ->
     Stack.connect netif ethif arpv4 ip icmpv4 udp tcp
 
   let create_backend_listener backend listenf =

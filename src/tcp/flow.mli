@@ -16,7 +16,16 @@
 
 module Make (IP:Tcpip.Ip.S) : sig
   include Tcpip.Tcp.S with type ipaddr = IP.ipaddr
-  val connect : IP.t -> t Lwt.t
+  val connect : ?verify_checksums:bool -> IP.t -> t Lwt.t
+  (** [connect ?verify_checksums ip] starts the TCP layer on [ip].
+
+      With [~verify_checksums:true], segments with an invalid TCP checksum are
+      dropped, as RFC 9293 requires. It is off by default because some network
+      interfaces deliver locally generated packets with the checksum left
+      blank, relying on checksum offload: mirage-net-xen, for instance, does not
+      handle the [rx_checksum_blank] flag, so traffic from dom0 or another guest
+      on the same host could be dropped. Enable it when the network interface
+      always delivers packets with complete checksums. *)
 
   (**/**)
   (* the number of open connections *)

@@ -73,6 +73,7 @@ struct
     (* clients in the process of connecting *)
     connects: (WIRE.t, ((connection, error) result Lwt.u * Sequence.t * Tcpip.Tcp.Keepalive.t option * bool ref)) Hashtbl.t;
     isn_key: Mirage_crypto.AES.CBC.key; (* secret for initial sequence numbers *)
+    verify_checksums: bool;
     (* the [bool ref] records whether the SYN had to be retransmitted *)
   }
 
@@ -679,6 +680,13 @@ struct
     match Unmarshal.of_cstruct data with
     | Error s -> Log.debug (fun f -> f "parsing TCP header failed: %s" s);
       Lwt.return_unit
+    | Ok _ when t.verify_checksums
+                && Tcpip_checksum.ones_complement_list
+                     [ Ip.pseudoheader t.ip ~src:dst src `TCP (Cstruct.length data); data ]
+                   <> 0 ->
+      Log.debug (fun f -> f "dropping TCP segment from %a with a bad checksum"
+                    Ip.pp_ipaddr src);
+      Lwt.return_unit
     | Ok (pkt, payload) ->
       let id =
         WIRE.v ~src_port:pkt.dst_port ~dst_port:pkt.src_port ~dst:src ~src:dst
@@ -884,7 +892,7 @@ struct
       | Ok (fl, _) -> Lwt.return (Ok fl)
 
   (* Construct the main TCP thread *)
-  let connect ip =
+  let connect ?(verify_checksums = false) ip =
     let listens = Hashtbl.create 1 in
     let connects = Hashtbl.create 1 in
     let channels = Hashtbl.create 7 in
@@ -892,7 +900,8 @@ struct
                  Fmt.(list ~sep:(any ", ") Ip.pp_prefix)
                  (Ip.configured_ips ip));
     Lwt.return { ip; listeners = Hashtbl.create 7; active = true; channels;
-             isn_key = Mirage_crypto.AES.CBC.of_secret (Mirage_crypto_rng.generate 16); listens; connects }
+             isn_key = Mirage_crypto.AES.CBC.of_secret (Mirage_crypto_rng.generate 16);
+             verify_checksums; listens; connects }
 
   let disconnect t =
     t.active <- false;

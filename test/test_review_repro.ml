@@ -22,8 +22,9 @@ let sut_ip = Ipaddr.V4.Prefix.address sut_cidr
 
 (* Like [Low_level.run], but the raw peer sends the first packet ([kick]) so
    the stack under test can be the passive (server) side. *)
-let run_server ?(cap=5) ?(wait_fsm=true) backend ~kick (initial_state, fsm_handler) sut () =
-  create_sut_stack backend >>= fun stack ->
+let run_server ?(cap=5) ?(wait_fsm=true) ?(verify=false) backend ~kick (initial_state, fsm_handler) sut () =
+  (if verify then VNETIF_STACK.create_stack ~tcp_verify_checksums:true ~cidr:sut_cidr ~gateway backend
+   else create_sut_stack backend) >>= fun stack ->
   create_raw_stack backend >>= fun (netif, ethif, arp, rawip) ->
   let error_mbox = Lwt_mvar.create_empty () in
   let stream, pushf = Lwt_stream.create () in
@@ -836,6 +837,40 @@ let isn_clock_driven () =
   in
   `Server ((fun ip -> send_client_syn ip), (`SYNACK1, fsm), sut_listens)
 
+(* 36. with checksum verification enabled, a corrupted segment is dropped *)
+let xmit_bad_checksum ~ip id ~rx_ack ~seq payload =
+  let src = WIRE.src id and dst = WIRE.dst id in
+  let header = { Tcp.Tcp_packet.urg = false; ack = true; psh = false; rst = false;
+                 syn = false; fin = false; window; options = [];
+                 sequence = Sequence.of_int32 seq; ack_number = rx_ack;
+                 src_port = WIRE.src_port id; dst_port = WIRE.dst_port id } in
+  let size = Tcp_wire.sizeof_tcp + Cstruct.length payload in
+  I.write ip ~fragment:false ~src dst `TCP ~size (fun buf ->
+      let pseudoheader = I.pseudoheader ip ~src dst `TCP size in
+      match Tcp.Tcp_packet.Marshal.into_cstruct header buf ~pseudoheader ~payload with
+      | Error e -> Alcotest.fail e
+      | Ok l ->
+        Cstruct.blit payload 0 buf l (Cstruct.length payload);
+        (* corrupt the checksum *)
+        Cstruct.set_uint8 buf 16 (Cstruct.get_uint8 buf 16 lxor 0xff);
+        size) [] >|= Result.get_ok
+
+let bad_checksum_dropped () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `SYN -> syn_ack ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `ACK
+    | `ACK ->
+      let id = reply_id_from ~src ~dst data in
+      xmit_bad_checksum ~ip id ~rx_ack:(ack_for data) ~seq:1000001l (Cstruct.create 10)
+      >>= fun () -> Mirage_sleep.ns (Duration.of_ms 200) >>= fun () ->
+      peer_seg ip ~src ~dst data ~seq:1000001l 20 >|= fun () -> Fsm_next `WAIT
+    | `WAIT when Tcp_wire.get_ack_number data = 1000011l ->
+      Lwt.return (Fsm_error "segment with a bad checksum was accepted")
+    | `WAIT when Tcp_wire.get_ack_number data = 1000021l -> Lwt.return Fsm_done
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Verify ((`SYN, fsm), sut_connects_then (fun _ -> Lwt.return_unit))
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -847,6 +882,10 @@ let run_test name = function
   | `Long (cap, fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
     VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap backend ~kick:no_kick fsm sut)
+  | `Verify (fsm, sut) -> fun () ->
+    let backend = VNETIF_STACK.create_backend () in
+    VNETIF_STACK.record_pcap backend (name ^ ".pcap")
+      (run_server ~cap:8 ~verify:true backend ~kick:no_kick fsm sut)
   | `Long_kick (cap, wait_fsm, fsm, sut, kick) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
     VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap ~wait_fsm backend ~kick fsm sut)
@@ -888,5 +927,6 @@ let suite = [
   "disconnect cleans up pending connections", `Quick, run_test "r33" (disconnect_cleans_up ());
   "concurrent close sends one FIN", `Quick, run_test "r34" (concurrent_close ());
   "ISNs are clock-driven (RFC 6528)", `Quick, run_test "r35" (isn_clock_driven ());
+  "bad checksum dropped when verification is on", `Quick, run_test "r36" (bad_checksum_dropped ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
 ]
