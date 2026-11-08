@@ -45,6 +45,15 @@ val set_ack_seq_win : t -> Sequence.t -> int -> unit
 
 (* rx_wnd: number of bytes we are willing to accept *)
 val rx_wnd : t -> int32
+val max_rx_wnd : t -> int32
+(** The size of the receive buffer, i.e. the largest receive window. *)
+
+val accept_window_update : t -> seq:Sequence.t -> ack:Sequence.t -> bool
+(** [accept_window_update t ~seq ~ack] is [true] if a segment with these
+    sequence and acknowledgment numbers may update the send window (it is not
+    older than the segment that last did, RFC 9293 SND.WL1/SND.WL2); it then
+    records it as the latest. *)
+
 val rx_wnd_unscaled : t -> int32
 (** The receive window as advertised on the wire (scaled down, rounded up). *)
 

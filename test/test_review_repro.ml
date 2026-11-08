@@ -520,6 +520,129 @@ let syn_backlog () =
   in
   `Long_kick (5, (`ANY, fsm), sut, kick)
 
+(* ---- Segment acceptance (RFC 9293 3.10.7.4, RFC 5961) ---- *)
+
+(* peer side of an established connection: SYN-ACK with ISN 1000000, so the
+   peer's data starts at 1000001; [after_handshake] runs on the SUT's ACK *)
+let established ?(win=window) after_handshake =
+  fun ip state ~src ~dst data ->
+    match state with
+    | `SYN -> syn_ack ~window:win ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `HS
+    | `HS -> after_handshake ip ~src ~dst data
+    | s -> Lwt.return (Fsm_next s)
+
+let peer_seg ?(ack_flag=true) ?(win=window) ip ~src ~dst data ~seq len =
+  WIRE.xmit ~ip (reply_id_from ~src ~dst data)
+    ~rx_ack:(if ack_flag then ack data else None) ~seq:(Sequence.of_int32 seq)
+    ~window:win ~options:[] (Cstruct.create len) >|= Result.get_ok
+
+let sut_reads n stack =
+  let conn = VNETIF_STACK.Stack.TCP.create_connection (VNETIF_STACK.Stack.tcp stack) in
+  or_error "connect" conn (Ipaddr.V4 server_ip, 80) >>= fun flow ->
+  let rec drain got = if got >= n then Lwt.return flow else
+      VNETIF_STACK.Stack.TCP.read flow >>= function
+      | Ok (`Data b) -> drain (got + Cstruct.length b)
+      | _ -> Alcotest.fail "unexpected end of stream" in
+  drain 0
+
+(* 22. an out-of-window segment is answered with an ACK *)
+let out_of_window_acked () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `OOW when Tcp_wire.get_ack data && Tcp_wire.get_ack_number data = 1000001l ->
+      Lwt.return Fsm_done
+    | s -> established (fun ip ~src ~dst data ->
+        peer_seg ip ~src ~dst data ~seq:(Int32.add 1000001l 300000l) 10
+        >|= fun () -> Fsm_next `OOW) ip s ~src ~dst data
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun _ -> Lwt.return_unit))
+
+(* 23. ACKs for invalid segments are rate limited *)
+let invalid_ack_rate_limit () =
+  let acks = ref 0 in
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `COUNT -> incr acks; Lwt.return (Fsm_next `COUNT)
+    | s -> established (fun ip ~src ~dst data ->
+        let rec go i = if i = 5 then Lwt.return_unit else
+            peer_seg ip ~src ~dst data ~seq:(Int32.add 1000001l 300000l) 10
+            >>= fun () -> go (i + 1) in
+        go 0 >|= fun () -> Fsm_next `COUNT) ip s ~src ~dst data
+  in
+  let sut stack =
+    sut_connects_then (fun _ -> Lwt.return_unit) stack >|= fun () ->
+    Alcotest.(check int) "one ACK for 5 out-of-window segments" 1 !acks
+  in
+  `Long_kick (5, (`SYN, fsm), sut, no_kick)
+
+(* 24. a segment without the ACK flag is ignored in ESTABLISHED *)
+let no_ack_flag_dropped () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `WAIT when Tcp_wire.get_ack_number data = 1000011l ->
+      Lwt.return (Fsm_error "data in a segment without ACK flag was accepted")
+    | `WAIT when Tcp_wire.get_ack_number data = 1000021l -> Lwt.return Fsm_done
+    | s -> established (fun ip ~src ~dst data ->
+        peer_seg ~ack_flag:false ip ~src ~dst data ~seq:1000001l 10 >>= fun () ->
+        Mirage_sleep.ns (Duration.of_ms 200) >>= fun () ->
+        peer_seg ip ~src ~dst data ~seq:1000001l 20 >|= fun () -> Fsm_next `WAIT)
+        ip s ~src ~dst data
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun _ -> Lwt.return_unit))
+
+(* 25. a reordered old segment must not update the send window *)
+let stale_window_update () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `DATA when Cstruct.length (snd (parse data)) > 0 -> Lwt.return Fsm_done
+    | s -> established ~win:5000 (fun ip ~src ~dst data ->
+        peer_seg ~win:5000 ip ~src ~dst data ~seq:1000001l 100 >>= fun () ->
+        peer_seg ~win:5000 ip ~src ~dst data ~seq:1000101l 100 >>= fun () ->
+        (* stale: older sequence number, advertising a zero window *)
+        peer_seg ~win:0 ip ~src ~dst data ~seq:1000001l 0 >|= fun () ->
+        Fsm_next `DATA) ip s ~src ~dst data
+  in
+  `Client ((`SYN, fsm), fun stack ->
+      sut_reads 200 stack >>= fun flow ->
+      Mirage_sleep.ns (Duration.of_ms 100) >>= fun () ->
+      VNETIF_STACK.Stack.TCP.write flow (Cstruct.create 100) >>= fun _ ->
+      Mirage_sleep.ns (Duration.of_ms 500))
+
+(* 26. a longer segment at the same sequence number replaces a shorter one
+   in the out-of-order queue *)
+let ooo_same_seq_longer () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `WAIT when Tcp_wire.get_ack_number data = 1000151l -> Lwt.return Fsm_done
+    | `WAIT when Tcp_wire.get_ack_number data = 1000111l ->
+      Lwt.return (Fsm_error "kept the shorter out-of-order segment")
+    | s -> established (fun ip ~src ~dst data ->
+        peer_seg ip ~src ~dst data ~seq:1000101l 10 >>= fun () ->
+        peer_seg ip ~src ~dst data ~seq:1000101l 50 >>= fun () ->
+        peer_seg ip ~src ~dst data ~seq:1000001l 100 >|= fun () -> Fsm_next `WAIT)
+        ip s ~src ~dst data
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun _ -> Lwt.return_unit))
+
+(* 27. the out-of-order queue is bounded (1024 segments) *)
+let ooo_bounded () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `WAIT ->
+      let a = Tcp_wire.get_ack_number data in
+      if a = 1000001l then Lwt.return (Fsm_next `WAIT)
+      else if a = Int32.add 1000002l 1024l then Lwt.return Fsm_done
+      else Lwt.return (Fsm_error (Fmt.str "unexpected ACK %lu (unbounded queue?)" a))
+    | s -> established (fun ip ~src ~dst data ->
+        let rec go i = if i = 1100 then Lwt.return_unit else
+            peer_seg ip ~src ~dst data ~seq:(Int32.add 1000002l (Int32.of_int i)) 1
+            >>= fun () -> go (i + 1) in
+        go 0 >>= fun () ->
+        peer_seg ip ~src ~dst data ~seq:1000001l 1 >|= fun () -> Fsm_next `WAIT)
+        ip s ~src ~dst data
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun _ -> Lwt.return_unit))
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -558,5 +681,11 @@ let suite = [
   "unacceptable ACK in SYN-SENT is reset", `Quick, run_test "r19" (bad_ack_syn_sent ());
   "unacceptable ACK in SYN-RCVD is reset", `Quick, run_test "r20" (bad_ack_syn_rcvd ());
   "SYN backlog is bounded", `Quick, run_test "r21" (syn_backlog ());
+  "out-of-window segment is ACKed", `Quick, run_test "r22" (out_of_window_acked ());
+  "ACKs for invalid segments are rate limited", `Quick, run_test "r23" (invalid_ack_rate_limit ());
+  "segment without ACK flag is dropped", `Quick, run_test "r24" (no_ack_flag_dropped ());
+  "stale segment does not update the window", `Quick, run_test "r25" (stale_window_update ());
+  "longer same-seq out-of-order segment is kept", `Quick, run_test "r26" (ooo_same_seq_longer ());
+  "out-of-order queue is bounded", `Quick, run_test "r27" (ooo_bounded ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
 ]

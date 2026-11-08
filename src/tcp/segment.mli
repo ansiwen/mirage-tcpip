@@ -51,6 +51,10 @@ module Rx (ACK:Ack.M) : sig
       update the window, extract any ready segments into the
       user receive queue, and signal any acks to the Tx queue *)
 
+  val acceptable : t -> segment -> bool
+  (** [acceptable t seg] is [true] if [seg] would be processed normally by
+      [input] (as opposed to being dropped or answered with an ACK only). *)
+
 end
 
 type tx_flags = No_flags | Syn | Fin | Rst | Psh

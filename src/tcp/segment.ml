@@ -85,11 +85,21 @@ module Rx(ACK: Ack.M) = struct
     tx_ack: (Sequence.t * int) Lwt_mvar.t; (* Acks of our transmitted segs *)
     wnd: Window.t;
     state: State.t;
+    mutable ooo_count: int;    (* segments waiting in [segs] *)
+    mutable ooo_bytes: int;    (* payload bytes waiting in [segs] *)
+    mutable last_invalid_ack: int64; (* when we last answered an invalid
+                                        segment with an ACK (rate limit) *)
   }
 
   let create ~rx_data ~ack ~wnd ~state ~tx_ack =
     let segs = S.empty in
-    { segs; rx_data; ack; tx_ack; wnd; state }
+    { segs; rx_data; ack; tx_ack; wnd; state; ooo_count = 0; ooo_bytes = 0;
+      last_invalid_ack = Int64.min_int }
+
+  (* Bounds on the out-of-order queue: a peer sending many overlapping or
+     tiny segments must not be able to use unbounded memory (or CPU, as the
+     queue is walked for every segment). *)
+  let max_ooo_segments = 1024
 
   let pp fmt t =
     let pp_v fmt seg =
@@ -121,15 +131,24 @@ module Rx(ACK: Ack.M) = struct
       end
     else if seg.header.syn then
       `ChallengeAck
-    else if Window.valid q.wnd seg.header.sequence then
+    else if not (Window.valid q.wnd seg.header.sequence) then
+      (* unacceptable sequence number: drop, but answer with an ACK
+         (RFC 9293 3.10.7.4) *)
+      `Unacceptable
+    else if not seg.header.ack then
+      (* in a synchronized state a segment without ACK is dropped *)
+      `Drop
+    else
       let min = Sequence.(sub (Window.tx_una q.wnd) (of_int32 (Window.max_tx_wnd q.wnd))) in
       if Sequence.between seg.header.ack_number min (Window.tx_nxt q.wnd) then
         `Ok
       else
         (* rfc5961 5.2 *)
         `ChallengeAck
-    else
-      `Drop
+
+  (* Can [seg] be processed normally (as opposed to being dropped, answered
+     with a challenge ACK, ...)? *)
+  let acceptable q seg = check_valid_segment q seg = `Ok
 
   (* Cut off any data beyond the right edge of the advertised receive window
      (RFC 9293 3.10.7.4: only the part inside the window is acceptable, and an
@@ -149,9 +168,21 @@ module Rx(ACK: Ack.M) = struct
       { header = { seg.header with fin = false };
         payload = Cstruct.sub seg.payload 0 (max 0 allowed) }, true
 
+  (* ACKs sent in reply to invalid segments (RFC 5961 challenge ACKs and ACKs
+     for out-of-window segments) are rate limited per connection, as Linux
+     does (tcp_invalid_ratelimit), so that a flood of forged segments does
+     not turn into a flood of ACKs.  A per-connection limit, unlike the
+     global one suggested by RFC 5961 section 7, does not leak information
+     between connections (CVE-2016-5696). *)
+  let invalid_ack_interval = Duration.of_ms 500
+
   let send_challenge_ack q =
-    (* TODO:  rfc5961 ACK Throttling *)
-    ACK.pushack q.ack Sequence.zero
+    let now = Mirage_mtime.elapsed_ns () in
+    if Int64.sub now q.last_invalid_ack >= invalid_ack_interval
+    || q.last_invalid_ack = Int64.min_int then begin
+      q.last_invalid_ack <- now;
+      ACK.pushack q.ack Sequence.zero
+    end else Lwt.return_unit
 
   (* Given an input segment, the window information, and a receive
      queue, update the window, extract any ready segments into the
@@ -170,7 +201,24 @@ module Rx(ACK: Ack.M) = struct
       if not occupies_seq_space
       && Sequence.lt seg.header.sequence (Window.rx_nxt_inseq q.wnd) then
         force_ack := true;
-      let segs = if occupies_seq_space then S.add seg q.segs else q.segs in
+      let len_new = Cstruct.length seg.payload in
+      let future =
+        Sequence.gt seg.header.sequence (Window.rx_nxt_inseq q.wnd) in
+      let segs =
+        if not occupies_seq_space then q.segs
+        else match S.find_opt seg q.segs with
+          | Some old when Cstruct.length old.payload >= len_new && (old.header.fin || not seg.header.fin) ->
+            (* already have this sequence number with at least as much data *)
+            q.segs
+          | Some old -> S.add seg (S.remove old q.segs)
+          | None when future
+                   && (q.ooo_count >= max_ooo_segments
+                       || q.ooo_bytes + len_new > Int32.to_int (Window.max_rx_wnd q.wnd)) ->
+            (* out-of-order queue full: drop it, the peer will retransmit *)
+            force_ack := true;
+            q.segs
+          | None -> S.add seg q.segs
+      in
       (* Walk through the set and get a list of contiguous segments *)
       let ready, waiting = S.fold (fun seg acc ->
           match Sequence.compare seg.header.sequence (Window.rx_nxt_inseq q.wnd) with
@@ -194,20 +242,33 @@ module Rx(ACK: Ack.M) = struct
           | _ -> assert false
         ) segs (S.empty, S.empty) in
       q.segs <- waiting;
+      q.ooo_count <- 0; q.ooo_bytes <- 0;
+      S.iter (fun s ->
+          q.ooo_count <- q.ooo_count + 1;
+          q.ooo_bytes <- q.ooo_bytes + Cstruct.length s.payload) waiting;
       (* If the segment has an ACK, tell the transmit side *)
       let tx_ack =
         if seg.header.ack && (Sequence.geq seg.header.ack_number (Window.ack_seq q.wnd)) then begin
           State.tick q.state (State.Recv_ack seg.header.ack_number);
+          (* Only take the window from this segment if it is not older than
+             the one that last updated it (SND.WL1/SND.WL2, RFC 9293
+             3.10.7.4): a reordered old segment must not shrink the window *)
+          let window =
+            if Window.accept_window_update q.wnd
+                ~seq:seg.header.sequence ~ack:seg.header.ack_number
+            then seg.header.window
+            else Window.ack_win q.wnd
+          in
           let data_in_flight = Window.tx_inflight q.wnd in
           let ack_has_advanced = (Window.ack_seq q.wnd) <> seg.header.ack_number in
-          let win_has_changed = (Window.ack_win q.wnd) <> seg.header.window in
+          let win_has_changed = (Window.ack_win q.wnd) <> window in
           if ((data_in_flight && (Window.ack_serviced q.wnd || not ack_has_advanced)) ||
               (not data_in_flight && win_has_changed)) then begin
             Window.set_ack_serviced q.wnd false;
-            Window.set_ack_seq_win q.wnd seg.header.ack_number seg.header.window;
+            Window.set_ack_seq_win q.wnd seg.header.ack_number window;
             Lwt_mvar.put q.tx_ack ((Window.ack_seq q.wnd), (Window.ack_win q.wnd))
           end else begin
-            Window.set_ack_seq_win q.wnd seg.header.ack_number seg.header.window;
+            Window.set_ack_seq_win q.wnd seg.header.ack_number window;
             Lwt.return_unit
           end
         end else Lwt.return_unit
@@ -232,7 +293,7 @@ module Rx(ACK: Ack.M) = struct
           end else Lwt.return_unit)
       in
       tx_ack <&> urx_inform
-    | `ChallengeAck ->
+    | `ChallengeAck | `Unacceptable ->
       send_challenge_ack q
     | `Drop ->
       Lwt.return_unit

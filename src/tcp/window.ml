@@ -30,6 +30,9 @@ type t = {
   mutable ack_serviced: bool;
   mutable ack_seq: Sequence.t;
   mutable ack_win: int;
+  mutable snd_wl1: Sequence.t;     (* sequence number of the segment that
+                                      last updated the send window *)
+  mutable snd_wl2: Sequence.t;     (* acknowledgment number of that segment *)
 
   mutable snd_una: Sequence.t;
   mutable tx_nxt: Sequence.t;
@@ -81,6 +84,7 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
   let ack_seq = tx_nxt in
   (* last window received from the peer (unscaled), to detect window updates *)
   let ack_win = tx_wnd in
+  let snd_wl1 = rx_isn and snd_wl2 = tx_isn in
   let rx_wnd = Int32.(shift_left (of_int rx_wnd) rx_wnd_scale) in
   let max_rx_wnd = rx_wnd in
   let tx_wnd = Int32.(shift_left (of_int tx_wnd) tx_wnd_scale) in
@@ -100,7 +104,7 @@ let t ~rx_wnd_scale ~tx_wnd_scale ~rx_wnd ~tx_wnd ~rx_isn ~tx_mss ~tx_isn =
   let rto = (Duration.of_ms 667) in
   let backoff_count = 0 in
   { tx_isn; rx_isn; max_rx_wnd; max_tx_wnd;
-    ack_serviced; ack_seq; ack_win;
+    ack_serviced; ack_seq; ack_win; snd_wl1; snd_wl2;
     snd_una; tx_nxt; tx_wnd; rx_nxt; rx_nxt_inseq;
     fast_rec_th; rx_wnd; tx_wnd_scale; rx_wnd_scale;
     ssthresh; cwnd; tx_mss; fast_recovery; rto_recovery;
@@ -142,6 +146,16 @@ let rx_wnd_edge t =
 let ack_serviced t = t.ack_serviced
 let ack_seq t = t.ack_seq
 let ack_win t = t.ack_win
+
+(* RFC 9293 3.10.7.4: update the send window from a segment only if
+   SND.WL1 < SEG.SEQ, or SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK *)
+let accept_window_update t ~seq ~ack =
+  let newer = Sequence.lt t.snd_wl1 seq
+              || (Sequence.compare t.snd_wl1 seq = 0 && Sequence.leq t.snd_wl2 ack) in
+  if newer then begin t.snd_wl1 <- seq; t.snd_wl2 <- ack end;
+  newer
+
+let max_rx_wnd t = t.max_rx_wnd
 
 let set_ack_serviced t v = t.ack_serviced <- v
 let set_ack_seq_win t s w =

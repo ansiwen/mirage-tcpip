@@ -187,10 +187,11 @@ struct
     (* Process an incoming TCP packet that has an active PCB *)
     let input _t parsed (pcb,_) =
       let { rxq; _ } = pcb in
-      (* The connection is alive! *)
+      (* The connection is alive! (Only an acceptable segment counts: anyone
+         can send a packet with the right addresses and ports.) *)
       begin match pcb.keepalive with
-      | None -> ()
-      | Some keepalive -> KEEPALIVE.refresh keepalive
+      | Some keepalive when RXS.acceptable rxq parsed -> KEEPALIVE.refresh keepalive
+      | _ -> ()
       end;
       (* Coalesce any outstanding segments and retrieve ready segments *)
       RXS.input rxq parsed
