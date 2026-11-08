@@ -72,10 +72,32 @@ struct
         Hashtbl.t;
     (* clients in the process of connecting *)
     connects: (WIRE.t, ((connection, error) result Lwt.u * Sequence.t * Tcpip.Tcp.Keepalive.t option * bool ref)) Hashtbl.t;
+    isn_key: Mirage_crypto.AES.CBC.key; (* secret for initial sequence numbers *)
     (* the [bool ref] records whether the SYN had to be retransmitted *)
   }
 
   let num_open_channels t = Hashtbl.length t.channels
+
+  (* Initial sequence numbers (RFC 6528, RFC 9293 3.4.1):
+       ISN = M + F(localip, localport, remoteip, remoteport, secretkey)
+     M is a clock ticking every 4 microseconds, so that successive incarnations
+     of a connection get increasing ISNs and old duplicates are unlikely to be
+     accepted; F is a keyed pseudo-random function (AES-CBC-MAC over a
+     prefix-free encoding of the 4-tuple), so ISNs cannot be predicted by an
+     off-path attacker. *)
+  let isn t id =
+    let m = Int64.to_int32 (Int64.div (Mirage_mtime.elapsed_ns ()) 4000L) in
+    let tuple =
+      Fmt.str "%a|%d|%a|%d" Ip.pp_ipaddr (WIRE.src id) (WIRE.src_port id)
+        Ip.pp_ipaddr (WIRE.dst id) (WIRE.dst_port id)
+    in
+    let msg = String.make 1 (Char.chr (String.length tuple land 0xff)) ^ tuple in
+    let msg = msg ^ String.make ((16 - String.length msg mod 16) mod 16) '\000' in
+    let mac =
+      Mirage_crypto.AES.CBC.encrypt ~key:t.isn_key ~iv:(String.make 16 '\000') msg
+    in
+    let f = String.get_int32_be mac (String.length mac - 16) in
+    Sequence.of_int32 (Int32.add m f)
 
   let listen t ~port ?keepalive cb =
     if port < 0 || port > 65535 then
@@ -585,7 +607,7 @@ struct
          State.tick pcb.state State.Recv_rst;
          Lwt.cancel th
        | None -> ());
-      let tx_isn = Sequence.of_int32 (Randomconv.int32 Mirage_crypto_rng.generate) in
+      let tx_isn = isn t id in
       (* TODO: make this configurable per listener *)
       let rx_wnd = 65535 in
       let rx_wnd_scaleoffer = wscale_default in
@@ -816,7 +838,7 @@ struct
                    Ip.pp_ipaddr dst dst_port);
       Lwt.return (Error `No_free_port)
     | Some id ->
-    let tx_isn = Sequence.of_int32 (Randomconv.int32 Mirage_crypto_rng.generate) in
+    let tx_isn = isn t id in
     (* TODO: This is hardcoded for now - make it configurable *)
     let rx_wnd_scaleoffer = wscale_default in
     let options =
@@ -869,7 +891,8 @@ struct
     Log.info (fun f -> f "TCP layer connected on %a"
                  Fmt.(list ~sep:(any ", ") Ip.pp_prefix)
                  (Ip.configured_ips ip));
-    Lwt.return { ip; listeners = Hashtbl.create 7; active = true; channels; listens; connects }
+    Lwt.return { ip; listeners = Hashtbl.create 7; active = true; channels;
+             isn_key = Mirage_crypto.AES.CBC.of_secret (Mirage_crypto_rng.generate 16); listens; connects }
 
   let disconnect t =
     t.active <- false;

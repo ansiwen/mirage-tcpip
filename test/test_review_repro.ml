@@ -818,6 +818,24 @@ let concurrent_close () =
   in
   `Long_kick (5, false, (`SYN, fsm), sut, no_kick)
 
+(* 35. initial sequence numbers are clock-driven (RFC 6528): a new incarnation
+   of the same 4-tuple 200ms later gets an ISN about 200ms / 4us higher *)
+let isn_clock_driven () =
+  let fsm ip state ~src:_ ~dst:_ data =
+    let seq = Tcp_wire.get_sequence data in
+    match state with
+    | `SYNACK1 when Tcp_wire.get_syn data ->
+      xmit_client ip ~rst:true ~seq:(Int32.succ client_isn) ~ack:None >>= fun () ->
+      Mirage_sleep.ns (Duration.of_ms 200) >>= fun () ->
+      send_client_syn ip >|= fun () -> Fsm_next (`SYNACK2 seq)
+    | `SYNACK2 a when Tcp_wire.get_syn data && seq <> a ->
+      let d = Int64.logand (Int64.of_int32 (Int32.sub seq a)) 0xFFFFFFFFL in
+      if d >= 25_000L && d <= 500_000L then Lwt.return Fsm_done
+      else Lwt.return (Fsm_error (Fmt.str "ISN of the next incarnation differs by %Ld" d))
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Server ((fun ip -> send_client_syn ip), (`SYNACK1, fsm), sut_listens)
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -869,5 +887,6 @@ let suite = [
   "read after Eof returns Eof", `Quick, run_test "r32" (read_after_eof ());
   "disconnect cleans up pending connections", `Quick, run_test "r33" (disconnect_cleans_up ());
   "concurrent close sends one FIN", `Quick, run_test "r34" (concurrent_close ());
+  "ISNs are clock-driven (RFC 6528)", `Quick, run_test "r35" (isn_clock_driven ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
 ]
