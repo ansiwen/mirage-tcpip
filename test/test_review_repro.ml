@@ -22,7 +22,7 @@ let sut_ip = Ipaddr.V4.Prefix.address sut_cidr
 
 (* Like [Low_level.run], but the raw peer sends the first packet ([kick]) so
    the stack under test can be the passive (server) side. *)
-let run_server ?(cap=5) backend ~kick (initial_state, fsm_handler) sut () =
+let run_server ?(cap=5) ?(wait_fsm=true) backend ~kick (initial_state, fsm_handler) sut () =
   create_sut_stack backend >>= fun stack ->
   create_raw_stack backend >>= fun (netif, ethif, arp, rawip) ->
   let error_mbox = Lwt_mvar.create_empty () in
@@ -49,7 +49,8 @@ let run_server ?(cap=5) backend ~kick (initial_state, fsm_handler) sut () =
       Lwt.pick [
         (Mirage_sleep.ns (Duration.of_sec cap) >>= fun () -> Lwt.return_some "timed out");
         (Lwt.join [
-            fsm_thread initial_state;
+            (if wait_fsm then fsm_thread initial_state
+             else (Lwt.async (fun () -> fsm_thread initial_state); Lwt.return_unit));
             sut stack;
             (Mirage_sleep.ns (Duration.of_ms 200) >>= fun () -> kick rawip);
           ] >>= fun () -> Lwt.return_none);
@@ -66,6 +67,10 @@ let send_client_syn ?(isn=client_isn) ip =
   WIRE.xmit ~ip client_id ~syn:true ~rx_ack:None ~seq:(Sequence.of_int32 isn)
     ~window:65535 ~options:[Opt.MSS 1460; Opt.Window_size_shift 7] (Cstruct.create 0)
   >|= Result.get_ok
+
+let sut_listens_other_port stack =
+  VNETIF_STACK.Stack.TCP.listen (VNETIF_STACK.Stack.tcp stack) ~port:81 (fun _ -> Lwt.return_unit);
+  Mirage_sleep.ns (Duration.of_ms 2500)
 
 let sut_listens stack =
   VNETIF_STACK.Stack.TCP.listen (VNETIF_STACK.Stack.tcp stack) ~port:80 (fun flow ->
@@ -389,6 +394,132 @@ let small_window () =
   `Client ((`SYN, fsm), sut_connects_then (fun flow ->
       VNETIF_STACK.Stack.TCP.write flow (Cstruct.create total) >|= fun _ -> ()))
 
+(* ---- Handshake and RST handling (RFC 9293 3.10.7, RFC 5961) ---- *)
+
+let sut_idle stack = ignore stack; Mirage_sleep.ns (Duration.of_ms 2500)
+
+let xmit_client ?(rst=false) ?(syn=false) ?(len=0) ip ~seq ~ack =
+  WIRE.xmit ~ip client_id ~rst ~syn ~rx_ack:(Option.map Sequence.of_int32 ack)
+    ~seq:(Sequence.of_int32 seq) ~window:65535 ~options:[] (Cstruct.create len)
+  >|= Result.get_ok
+
+let flags data =
+  Tcp_wire.get_rst data, Tcp_wire.get_ack data, Tcp_wire.get_sequence data,
+  Tcp_wire.get_ack_number data
+
+(* expect exactly one reply, a RST with the given seq and (optional) ack *)
+let expect_rst ~seq ~ack =
+  fun _ip `RST ~src:_ ~dst:_ data ->
+    let rst, has_ack, s, a = flags data in
+    let ok = rst && s = seq &&
+             (match ack with None -> not has_ack | Some x -> has_ack && a = x) in
+    Lwt.return (if ok then Fsm_done else Fsm_error (Fmt.str
+        "expected RST seq=%lu %s, got rst=%b ack=%b seq=%lu ack#=%lu" seq
+        (match ack with None -> "without ACK" | Some x -> Fmt.str "ACK %lu" x)
+        rst has_ack s a))
+
+(* 14-16. segments to a port without connection or listener *)
+let rst_closed_ack () =
+  `Server ((fun ip -> xmit_client ip ~seq:777l ~ack:(Some 4242l)),
+           (`RST, expect_rst ~seq:4242l ~ack:None), sut_idle)
+let rst_closed_data () =
+  `Server ((fun ip -> xmit_client ip ~len:10 ~seq:777l ~ack:None),
+           (`RST, expect_rst ~seq:0l ~ack:(Some 787l)), sut_idle)
+let rst_closed_syn () =
+  `Server ((fun ip -> WIRE.xmit ~ip client_id ~syn:true ~rx_ack:None
+               ~seq:(Sequence.of_int32 777l) ~window:65535 ~options:[] Cstruct.empty
+             >|= Result.get_ok),
+           (`RST, expect_rst ~seq:0l ~ack:(Some 778l)), sut_listens_other_port)
+
+(* 17. SYN-RCVD: an in-window RST that is not exactly RCV.NXT gets a challenge
+   ACK and the handshake can still complete *)
+let blind_rst_syn_rcvd () =
+  let fsm ip state ~src:_ ~dst:_ data =
+    let rst, has_ack, seq, ackn = flags data in
+    match state with
+    | `SYNACK when Tcp_wire.get_syn data ->
+      xmit_client ip ~rst:true ~seq:(Int32.add client_isn 101l)
+        ~ack:(Some (Int32.succ seq)) >|= fun () -> Fsm_next (`CHALLENGE seq)
+    | `CHALLENGE a when has_ack && not rst && ackn = Int32.succ client_isn ->
+      xmit_client ip ~len:10 ~seq:(Int32.succ client_isn) ~ack:(Some (Int32.succ a))
+      >|= fun () -> Fsm_next `DATA_ACK
+    | `DATA_ACK when rst -> Lwt.return (Fsm_error "half-open connection was reset by a blind RST")
+    | `DATA_ACK when has_ack && ackn = Int32.add client_isn 11l -> Lwt.return Fsm_done
+    | s -> ignore seq; Lwt.return (Fsm_next s)
+  in
+  `Server ((fun ip -> send_client_syn ip), (`SYNACK, fsm), sut_listens)
+
+(* 18. SYN-RCVD: a RST with exactly RCV.NXT aborts the half-open connection,
+   even without the ACK flag *)
+let exact_rst_syn_rcvd () =
+  let fsm ip state ~src:_ ~dst:_ data =
+    let rst, _, seq, _ = flags data in
+    match state with
+    | `SYNACK when Tcp_wire.get_syn data ->
+      xmit_client ip ~rst:true ~seq:(Int32.succ client_isn) ~ack:None >>= fun () ->
+      Mirage_sleep.ns (Duration.of_ms 200) >>= fun () ->
+      xmit_client ip ~seq:(Int32.succ client_isn) ~ack:(Some (Int32.succ seq))
+      >|= fun () -> Fsm_next `RST
+    | `RST when rst -> Lwt.return Fsm_done
+    | `RST when Tcp_wire.get_syn data -> Lwt.return (Fsm_next `RST) (* retransmitted SYN-ACK *)
+    | `RST -> Lwt.return (Fsm_error "half-open connection survived an exact RST")
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Server ((fun ip -> send_client_syn ip), (`SYNACK, fsm), sut_listens)
+
+(* 19. SYN-SENT: a SYN-ACK with an unacceptable ACK is answered with a RST *)
+let bad_ack_syn_sent () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `SYN ->
+      let bad = Int32.add (Tcp_wire.get_sequence data) 5l in
+      WIRE.xmit ~ip (reply_id_from ~src ~dst data) ~syn:true
+        ~rx_ack:(Some (Sequence.of_int32 bad)) ~seq:(Sequence.of_int32 1000000l)
+        ~window ~options:[] Cstruct.empty
+      >|= Result.get_ok >|= fun () -> Fsm_next (`RST bad)
+    | `RST bad ->
+      expect_rst ~seq:bad ~ack:None ip `RST ~src ~dst data
+  in
+  `Client ((`SYN, fsm), fun stack ->
+      let conn = VNETIF_STACK.Stack.TCP.create_connection (VNETIF_STACK.Stack.tcp stack) in
+      Lwt.pick [ (conn (Ipaddr.V4 server_ip, 80) >|= fun _ -> ());
+                 Mirage_sleep.ns (Duration.of_ms 2500) ])
+
+(* 20. SYN-RCVD: an unacceptable ACK is answered with a RST *)
+let bad_ack_syn_rcvd () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `SYNACK when Tcp_wire.get_syn data ->
+      let bad = Int32.add (Tcp_wire.get_sequence data) 7l in
+      xmit_client ip ~seq:(Int32.succ client_isn) ~ack:(Some bad)
+      >|= fun () -> Fsm_next (`RST bad)
+    | `RST _ when Tcp_wire.get_syn data -> Lwt.return (Fsm_next state)
+    | `RST bad -> expect_rst ~seq:bad ~ack:None ip `RST ~src ~dst data
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Server ((fun ip -> send_client_syn ip), (`SYNACK, fsm), sut_listens)
+
+(* 21. the number of half-open connections is bounded *)
+let syn_backlog () =
+  let synacks = Hashtbl.create 2048 in
+  let fsm _ip state ~src:_ ~dst:_ data =
+    if Tcp_wire.get_syn data then Hashtbl.replace synacks (Tcp_wire.get_dst_port data) ();
+    Lwt.return (Fsm_next state)
+  in
+  let kick ip =
+    let rec go i = if i = 1100 then Lwt.return_unit else
+        let id = WIRE.v ~src:server_ip ~src_port:(20000 + i) ~dst:sut_ip ~dst_port:80 in
+        WIRE.xmit ~ip id ~syn:true ~rx_ack:None ~seq:(Sequence.of_int32 5000l)
+          ~window:65535 ~options:[] Cstruct.empty >>= fun _ -> go (i + 1) in
+    go 0
+  in
+  let sut stack =
+    VNETIF_STACK.Stack.TCP.listen (VNETIF_STACK.Stack.tcp stack) ~port:80 (fun _ -> Lwt.return_unit);
+    Mirage_sleep.ns (Duration.of_ms 2500) >|= fun () ->
+    Alcotest.(check int) "SYN-ACKs sent (backlog limit 1024)" 1024 (Hashtbl.length synacks)
+  in
+  `Long_kick (5, (`ANY, fsm), sut, kick)
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -400,6 +531,9 @@ let run_test name = function
   | `Long (cap, fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
     VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap backend ~kick:no_kick fsm sut)
+  | `Long_kick (cap, fsm, sut, kick) -> fun () ->
+    let backend = VNETIF_STACK.create_backend () in
+    VNETIF_STACK.record_pcap backend (name ^ ".pcap") (run_server ~cap ~wait_fsm:false backend ~kick fsm sut)
 
 let suite = [
   "fast retransmit uses the segment's own seq", `Quick, run_test "r6" (fast_rexmit_alignment ());
@@ -416,5 +550,13 @@ let suite = [
   "receiver advertises and enforces a zero window", `Quick, run_test "r11" (zero_window_advertised ());
   "persist timer probes a zero window", `Quick, run_test "r12" (zero_window_probe ());
   "window smaller than MSS does not stall", `Quick, run_test "r13" (small_window ());
+  "RST to an ACK for a closed port", `Quick, run_test "r14" (rst_closed_ack ());
+  "RST to data without ACK for a closed port", `Quick, run_test "r15" (rst_closed_data ());
+  "RST to a SYN for a closed port", `Quick, run_test "r16" (rst_closed_syn ());
+  "blind RST in SYN-RCVD gets a challenge ACK", `Quick, run_test "r17" (blind_rst_syn_rcvd ());
+  "exact RST without ACK aborts SYN-RCVD", `Quick, run_test "r18" (exact_rst_syn_rcvd ());
+  "unacceptable ACK in SYN-SENT is reset", `Quick, run_test "r19" (bad_ack_syn_sent ());
+  "unacceptable ACK in SYN-RCVD is reset", `Quick, run_test "r20" (bad_ack_syn_rcvd ());
+  "SYN backlog is bounded", `Quick, run_test "r21" (syn_backlog ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
 ]

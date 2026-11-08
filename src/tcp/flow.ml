@@ -30,9 +30,10 @@ struct
   module WIRE = Wire.Make(Ip)
   module KEEPALIVE = Keepalive
 
-  type error = [ Tcpip.Tcp.error | WIRE.error]
+  type error = [ Tcpip.Tcp.error | WIRE.error | `No_free_port ]
 
   let pp_error ppf = function
+    | `No_free_port -> Fmt.string ppf "no free local port for the connection"
     | #Tcpip.Tcp.error as e -> Tcpip.Tcp.pp_error ppf e
     | #WIRE.error as e -> WIRE.pp_error ppf e
 
@@ -64,7 +65,6 @@ struct
     ip : Ip.t;
     listeners : (int, Tcpip.Tcp.Keepalive.t option * (flow -> unit Lwt.t)) Hashtbl.t ;
     mutable active : bool ;
-    mutable localport : int;
     channels: (WIRE.t, connection) Hashtbl.t;
     (* server connections the process of connecting - SYN-ACK sent
        waiting for ACK *)
@@ -109,14 +109,23 @@ struct
       let psh = match flags with Segment.Psh -> true | _ -> false in
       WIRE.xmit ~ip id ~syn ~fin ~rst ~psh ~rx_ack ~seq ~window ~options datav
 
-    (* Output an RST response when we dont have a PCB *)
-    let send_rst { ip; _ } id ~sequence ~ack_number ~syn ~fin =
-      let datalen = Int32.add (if syn then 1l else 0l) (if fin then 1l else 0l) in
-      let window = 0 in
-      let options = [] in
-      let seq = ack_number in
-      let rx_ack = Some Sequence.(add sequence (of_int32 datalen)) in
-      WIRE.xmit ~ip id ~rst:true ~rx_ack ~seq ~window ~options (Cstruct.create 0)
+    (* Reply with a RST to a segment that belongs to no connection (RFC 9293
+       3.10.7.1): if it carried an ACK, the RST takes its sequence number from
+       that ACK (and has no ACK itself); otherwise it has sequence number 0
+       and acknowledges everything the segment occupied.  A RST is never
+       answered with a RST. *)
+    let send_rst { ip; _ } id (h : Tcp_packet.t) ~payload_len =
+      if h.Tcp_packet.rst then Lwt.return_unit
+      else
+        let seq, rx_ack =
+          if h.Tcp_packet.ack then h.Tcp_packet.ack_number, None
+          else
+            let len = payload_len + (if h.Tcp_packet.syn then 1 else 0)
+                      + (if h.Tcp_packet.fin then 1 else 0) in
+            Sequence.zero, Some Sequence.(add h.Tcp_packet.sequence (of_int len))
+        in
+        WIRE.xmit ~ip id ~rst:true ~rx_ack ~seq ~window:0 ~options:[] Cstruct.empty
+        >|= fun _ -> () (* discard errors; we won't retry *)
 
     (* Output a SYN packet *)
     let send_syn { ip; _ } id ~tx_isn ~options ~window =
@@ -482,39 +491,46 @@ struct
   let is_correct_ack ~tx_isn ~ack_number =
    (Sequence.compare (Sequence.succ tx_isn) ack_number) = 0
 
-  let process_reset t id ~ack ~ack_number =
+  (* Upper bound on half-open (SYN-RCVD) connections, so that a SYN flood
+     cannot exhaust memory.  SYNs beyond it are dropped; the client will
+     retransmit. *)
+  let max_half_open = 1024
+
+  let process_reset t id (h : Tcp_packet.t) =
     log_with_stats "process-reset" t;
-    if ack then
-        match hashtbl_find t.connects id with
-        | Some (wakener, tx_isn, _) ->
-          (* We don't send data in the syn request, so the expected ack is tx_isn + 1 *)
-          if is_correct_ack ~tx_isn ~ack_number then begin
-            Hashtbl.remove t.connects id;
-            Stats.decr_connect ();
-            Lwt.wakeup wakener (Error `Refused);
-            Lwt.return_unit
-          end else
-            Lwt.return_unit
-        | None ->
-          match hashtbl_find t.listens id with
-          | Some (_, (_, (pcb, th))) ->
-            Hashtbl.remove t.listens id;
-            Stats.decr_listen ();
-            State.tick pcb.state State.Recv_rst;
-            Lwt.cancel th;
-            Lwt.return_unit
-          | None ->
-            (* Incoming RST possibly to listen port - ignore per RFC793 pg65 *)
-            Lwt.return_unit
-    else
-        (* rst without ack, drop it *)
+    match hashtbl_find t.connects id with
+    | Some (wakener, tx_isn, _) ->
+      (* SYN-SENT: the RST is acceptable only if it acknowledges our SYN *)
+      if h.ack && is_correct_ack ~tx_isn ~ack_number:h.ack_number then begin
+        Hashtbl.remove t.connects id;
+        Stats.decr_connect ();
+        Lwt.wakeup wakener (Error `Refused)
+      end;
+      Lwt.return_unit
+    | None ->
+      match hashtbl_find t.listens id with
+      | Some (_, (_, (pcb, th))) ->
+        (* SYN-RCVD (RFC 5961 3.2): reset only if the sequence number is
+           exactly the next expected one; answer a merely in-window RST with
+           a challenge ACK, so that a blind RST cannot kill the connection. *)
+        if Sequence.compare h.sequence (Window.rx_nxt pcb.wnd) = 0 then begin
+          Hashtbl.remove t.listens id;
+          Stats.decr_listen ();
+          State.tick pcb.state State.Recv_rst;
+          Lwt.cancel th;
+          Lwt.return_unit
+        end else if Window.valid pcb.wnd h.sequence then
+          ACK.pushack pcb.ack (Window.rx_nxt pcb.wnd)
+        else Lwt.return_unit
+      | None ->
+        (* no connection: a RST is never answered *)
         Lwt.return_unit
 
-  let process_synack t id ~tx_wnd ~ack_number ~sequence ~options ~syn ~fin =
+  let process_synack t id (h : Tcp_packet.t) ~payload_len =
     log_with_stats "process-synack" t;
     match hashtbl_find t.connects id with
     | Some (wakener, tx_isn, keepalive) ->
-      if is_correct_ack ~tx_isn ~ack_number then (
+      if is_correct_ack ~tx_isn ~ack_number:h.ack_number then (
         Hashtbl.remove t.connects id;
         Stats.decr_connect ();
         let rx_wnd = 65535 in
@@ -522,34 +538,35 @@ struct
            sent in the SYN *)
         let rx_wnd_scaleoffer = wscale_default in
         new_client_connection t
-          { tx_wnd; sequence; options; tx_isn; rx_wnd; rx_wnd_scaleoffer }
-          id ack_number keepalive
+          { tx_wnd = h.window; sequence = h.sequence; options = h.options;
+            tx_isn; rx_wnd; rx_wnd_scaleoffer }
+          id h.ack_number keepalive
         >>= fun (pcb, th) ->
         Lwt.wakeup wakener (Ok (pcb, th));
         Lwt.return_unit
       ) else
-        (* Normally sending a RST reply to a random pkt would be in
-           order but here we stay quiet since we are actively trying
-           to connect this id *)
-        Lwt.return_unit
+        (* SYN-SENT, unacceptable ACK: reset it (RFC 9293 3.10.7.3) *)
+        Tx.send_rst t id h ~payload_len
     | None ->
-      (* Incoming SYN-ACK with no pending connect and no matching pcb
-         - send RST *)
-      Tx.send_rst t id ~sequence ~ack_number ~syn ~fin
-      >>= fun _ -> Lwt.return_unit (* discard errors; we won't retry *)
+      (* Incoming SYN-ACK with no pending connect and no matching pcb *)
+      Tx.send_rst t id h ~payload_len
 
-  let process_syn t id ~tx_wnd ~ack_number ~sequence ~options ~syn ~fin =
+  let process_syn t id (h : Tcp_packet.t) ~payload_len =
     log_with_stats "process-syn" t;
     match Hashtbl.find_opt t.listeners (WIRE.src_port id) with
     | Some (keepalive, process) ->
       begin match hashtbl_find t.listens id with
-      | Some (_, (_, (pcb, _))) when Sequence.succ sequence = Window.rx_nxt pcb.wnd ->
+      | Some (_, (_, (pcb, _))) when Sequence.succ h.sequence = Window.rx_nxt pcb.wnd ->
         (* The client retransmitted its SYN (our SYN-ACK was lost or is still
            in flight): answer with the original SYN-ACK, same ISN and options.
            Creating a new connection here would give the client two SYN-ACKs
            with different ISNs, and its ACK of the first would be dropped. *)
         Log.debug (fun f -> f "retransmitted SYN on %a, resending SYN-ACK" WIRE.pp id);
         TXS.retransmit_head pcb.txq
+      | None when Hashtbl.length t.listens >= max_half_open ->
+        Log.debug (fun f -> f "SYN backlog full (%d), dropping SYN on %a"
+                      max_half_open WIRE.pp id);
+        Lwt.return_unit
       | old ->
       (match old with
        | Some (_, (_, (pcb, th))) ->
@@ -567,18 +584,19 @@ struct
       let rx_wnd = 65535 in
       let rx_wnd_scaleoffer = wscale_default in
       new_server_connection t
-        { tx_wnd; sequence; options; tx_isn; rx_wnd; rx_wnd_scaleoffer }
+        { tx_wnd = h.window; sequence = h.sequence; options = h.options;
+          tx_isn; rx_wnd; rx_wnd_scaleoffer }
         id process keepalive
       >>= fun _ ->
       Lwt.return_unit
       end
     | None ->
-      Tx.send_rst t id ~sequence ~ack_number ~syn ~fin
-      >>= fun _ -> Lwt.return_unit (* discard errors; we won't retry *)
+      Tx.send_rst t id h ~payload_len
 
   let process_ack t id ~pkt =
     let open RXS in
     log_with_stats "process-ack" t;
+    let payload_len = Cstruct.length pkt.payload in
     match hashtbl_find t.listens id with
     | Some (tx_isn, (pushf, newconn)) ->
       if Tcp_packet.(is_correct_ack ~tx_isn ~ack_number:pkt.header.ack_number) then begin
@@ -592,37 +610,40 @@ struct
         (* send new connection up to listener *)
         pushf (fst newconn)
       end else
-        (* No RST because we are trying to connect on this id *)
-        Lwt.return_unit
+        (* SYN-RCVD, unacceptable ACK: reset it (RFC 9293 3.10.7.4) *)
+        Tx.send_rst t id pkt.header ~payload_len
     | None ->
       match hashtbl_find t.connects id with
-      | Some _ ->
-        (* No RST because we are trying to connect on this id *)
-        Lwt.return_unit
+      | Some (_, tx_isn, _) ->
+        (* SYN-SENT: an acceptable ACK without SYN is dropped, an
+           unacceptable one is reset (RFC 9293 3.10.7.3) *)
+        if is_correct_ack ~tx_isn ~ack_number:pkt.header.ack_number
+        then Lwt.return_unit
+        else Tx.send_rst t id pkt.header ~payload_len
       | None ->
-        let { sequence; Tcp_packet.ack_number; syn; fin; _ } = pkt.header in
         (* ACK but no matching pcb and no listen - send RST *)
-        Tx.send_rst t id ~sequence ~ack_number ~syn ~fin
-        >>= fun _ -> Lwt.return_unit (* if send fails, who cares *)
+        Tx.send_rst t id pkt.header ~payload_len
 
   let input_no_pcb t (parsed, payload) id =
     if not t.active then
       (* TODO: eventually send an RST? *)
       Lwt.return_unit
     else
-      let { sequence; Tcp_packet.ack_number; window; options; syn; fin; rst; ack; _ } = parsed in
+      let { Tcp_packet.syn; rst; ack; _ } = parsed in
+      let payload_len = Cstruct.length payload in
       match rst, syn, ack with
-      | true, _, _ -> process_reset t id ~ack ~ack_number
-      | false, true, true ->
-        process_synack t id ~ack_number ~sequence ~tx_wnd:window ~options ~syn ~fin
-      | false, true , false -> process_syn t id ~tx_wnd:window
-			         ~ack_number ~sequence ~options ~syn ~fin
+      | true, _, _ -> process_reset t id parsed
+      | false, true, true -> process_synack t id parsed ~payload_len
+      | false, true , false -> process_syn t id parsed ~payload_len
       | false, false, true  ->
         let open RXS in
         process_ack t id ~pkt:{ header = parsed; payload}
       | false, false, false ->
-        Log.debug (fun f -> f "incoming packet matches no connection table entry and has no useful flags set; dropping it");
-        Lwt.return_unit
+        (* neither SYN, ACK nor RST: dropped in SYN-SENT and SYN-RCVD, reset
+           when there is no connection at all (RFC 9293 3.10.7.1) *)
+        if Hashtbl.mem t.connects id || Hashtbl.mem t.listens id then
+          Lwt.return_unit
+        else Tx.send_rst t id parsed ~payload_len
 
   (* Main input function for TCP packets *)
   let input t ~src ~dst data =
@@ -710,27 +731,30 @@ struct
 
   let src pcb = WIRE.src pcb.id, WIRE.src_port pcb.id
 
+  (* Ephemeral port selection (RFC 6056): start at a random port in the
+     range and probe each port at most once, skipping ports with a listener
+     and ports already used for a connection to the same destination.
+     [None] when every port is taken. *)
+  let ephemeral_lo = 1024 and ephemeral_hi = 65535
+
   let getid t dst dst_port =
-    (* TODO: make this more robust and recognise when all ports are gone *)
-    let islistener _t _port =
-      (* TODO keep a list of active listen ports *)
-      false in
-    let idinuse t id =
+    let n = ephemeral_hi - ephemeral_lo + 1 in
+    let start = Randomconv.int ~bound:n Mirage_crypto_rng.generate in
+    let src = Ip.src t.ip ~dst in
+    let inuse id =
+      Hashtbl.mem t.listeners (WIRE.src_port id) ||
       Hashtbl.mem t.channels id ||
       Hashtbl.mem t.connects id ||
       Hashtbl.mem t.listens id
     in
-    let inuse t id = islistener t (WIRE.src_port id) || idinuse t id in
-    let rec bumpport t =
-      (match t.localport with
-       | 65535 -> t.localport <- 10000
-       | _ -> t.localport <- t.localport + 1);
-      let id =
-        WIRE.v ~src:(Ip.src t.ip ~dst) ~src_port:t.localport ~dst ~dst_port
-      in
-      if inuse t id then bumpport t else id
+    let rec probe i =
+      if i = n then None
+      else
+        let src_port = ephemeral_lo + (start + i) mod n in
+        let id = WIRE.v ~src ~src_port ~dst ~dst_port in
+        if inuse id then probe (i + 1) else Some id
     in
-    bumpport t
+    probe 0
 
   (* SYN retransmission timer *)
   let rec connecttimer t id tx_isn options window count =
@@ -754,14 +778,23 @@ struct
             (* normal mechanism for recovery is fine *)
             connecttimer t id tx_isn options window (count + 1)
           | Error `Would_fragment ->
-            (* this should not happen, if we've a transport that fragments syn.. *)
+            (* this should not happen, if we've a transport that fragments syn..
+               Fail the connect instead of leaving it pending forever. *)
             Log.err (fun m -> m "syn retransmission timer returned would fragment");
+            Hashtbl.remove t.connects id;
+            Stats.decr_connect ();
+            Lwt.wakeup wakener (Error `Would_fragment);
             Lwt.return_unit
         )
       else Lwt.return_unit
 
   let connect ?keepalive t ~dst ~dst_port =
-    let id = getid t dst dst_port in
+    match getid t dst dst_port with
+    | None ->
+      Log.warn (fun f -> f "no free local port to connect to %a:%d"
+                   Ip.pp_ipaddr dst dst_port);
+      Lwt.return (Error `No_free_port)
+    | Some id ->
     let tx_isn = Sequence.of_int32 (Randomconv.int32 Mirage_crypto_rng.generate) in
     (* TODO: This is hardcoded for now - make it configurable *)
     let rx_wnd_scaleoffer = wscale_default in
@@ -809,16 +842,13 @@ struct
 
   (* Construct the main TCP thread *)
   let connect ip =
-    let localport =
-      1024 + (Randomconv.int ~bound:(0xFFFF - 1024) Mirage_crypto_rng.generate)
-    in
     let listens = Hashtbl.create 1 in
     let connects = Hashtbl.create 1 in
     let channels = Hashtbl.create 7 in
     Log.info (fun f -> f "TCP layer connected on %a"
                  Fmt.(list ~sep:(any ", ") Ip.pp_prefix)
                  (Ip.configured_ips ip));
-    Lwt.return { ip; listeners = Hashtbl.create 7; active = true; localport; channels; listens; connects }
+    Lwt.return { ip; listeners = Hashtbl.create 7; active = true; channels; listens; connects }
 
   let disconnect t =
     t.active <- false;
