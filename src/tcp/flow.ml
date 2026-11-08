@@ -292,10 +292,6 @@ struct
       | None ->
         Log.debug (fun f -> f "error in removing %a - no such connection" WIRE.pp id)
 
-  let pcb_allocs = ref 0
-  let th_allocs = ref 0
-  let pcb_frees = ref 0
-  let th_frees = ref 0
 
   let resolve_wnd_scaling options rx_wnd_scaleoffer =
     let tx_wnd_scale = List.fold_left (fun a ->
@@ -323,7 +319,11 @@ struct
       rx_wnd_scaleoffer: int }
 
 
-  let keepalive_cb t id wnd state urx = function
+  (* Keep-alives only make sense on an idle synchronized connection whose
+     peer has not closed it yet *)
+  let keepalive_cb t id wnd state urx action =
+    match State.state state, action with
+    | (State.Established | State.Close_wait), action -> begin match action with
   | `SendProbe ->
     Log.debug (fun f -> f "Sending keepalive on connection %a" WIRE.pp id);
     (* From https://tools.ietf.org/html/rfc1122#page-101
@@ -354,6 +354,8 @@ struct
     (* Close the read direction *)
     User_buffer.Rx.add_r urx None >>= fun () ->
     Lwt.return_unit
+    end
+    | _ -> Lwt.return_unit
 
   let emitted_keepalive_warning = ref false
 
@@ -407,8 +409,10 @@ struct
     (* Set up transmit and receive queues *)
     (* Set once [utx] exists (it depends on [state], which needs [on_close]). *)
     let wake_writers = ref (fun () -> Lwt.return_unit) in
+    let stop_keepalive = ref (fun () -> ()) in
     let on_close () =
       clearpcb t id tx_isn wnd;
+      !stop_keepalive ();
       (* The connection is gone (normal close, reset, retransmission or
          FIN_WAIT_2 timeout): blocked readers get [`Eof] and blocked writers
          [`Closed], as documented for [Tcpip.Tcp.S], instead of hanging. *)
@@ -435,7 +439,9 @@ struct
           Log.warn (fun f -> f "using keep-alives can cause excessive memory consumption: https://github.com/mirage/mirage-tcpip/issues/367");
           emitted_keepalive_warning := true
         end;
-        Some (KEEPALIVE.create config (keepalive_cb t id wnd state urx)) in
+        let k = KEEPALIVE.create config (keepalive_cb t id wnd state urx) in
+        stop_keepalive := (fun () -> KEEPALIVE.stop k);
+        Some k in
     (* Construct basic PCB in Syn_received state *)
     let pcb = { state; rxq; txq; wnd; id; ack; urx; utx; keepalive } in
     (* Compose the overall thread from the various tx/rx threads
@@ -456,12 +462,6 @@ struct
     in
     List.iter (fun t -> Lwt.on_failure t catch_and_cancel) threads;
     let th = Lwt.join threads in
-    pcb_allocs := !pcb_allocs + 1;
-    th_allocs := !th_allocs + 1;
-    let fnpcb = fun _ -> pcb_frees := !pcb_frees + 1 in
-    let fnth = fun _ -> th_frees := !th_frees + 1 in
-    Gc.finalise fnpcb pcb;
-    Gc.finalise fnth th;
     Lwt.return (pcb, th, opts)
 
   let new_server_connection t params id pushf keepalive =
@@ -876,9 +876,20 @@ struct
     Log.info (fun f -> f "TCP layer disconnected on %a"
                  Fmt.(list ~sep:(any ", ") Ip.pp_prefix)
                  (Ip.configured_ips t.ip));
-    let conns = Hashtbl.fold (fun _ (pcb, _) acc -> pcb :: acc) t.channels [] in
-    Lwt_list.iter_p close conns >|= fun () ->
+    (* pending active opens fail *)
+    let pending = Hashtbl.fold (fun _ (w, _, _, _) acc -> w :: acc) t.connects [] in
+    List.iter (fun _ -> Stats.decr_connect ()) pending;
+    Hashtbl.reset t.connects;
+    List.iter (fun w -> Lwt.wakeup_later w (Error `Refused)) pending;
+    (* half-open connections are abandoned: moving them to Closed stops their
+       SYN-ACK retransmissions *)
+    let half_open = Hashtbl.fold (fun _ (_, (_, (pcb, th))) acc -> (pcb, th) :: acc) t.listens [] in
     Hashtbl.reset t.listens;
-    Hashtbl.reset t.connects
-    (* TODO: should there be Lwt tasks being cancelled? *)
+    List.iter (fun (pcb, th) ->
+        Stats.decr_listen ();
+        State.tick pcb.state State.Recv_rst;
+        Lwt.cancel th) half_open;
+    (* established connections are closed *)
+    let conns = Hashtbl.fold (fun _ (pcb, _) acc -> pcb :: acc) t.channels [] in
+    Lwt_list.iter_p close conns
 end

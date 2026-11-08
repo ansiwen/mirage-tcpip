@@ -52,6 +52,9 @@ val create: Tcpip.Tcp.Keepalive.t -> ([ `SendProbe | `Close] -> unit Lwt.t) -> t
     [f] in future depending on both the [configuration] and any calls to
     [refresh] *)
 
+val stop: t -> unit
+(** [stop t] cancels the keep-alive timer for good: the connection is gone. *)
+
 val refresh: t -> unit
 (** [refresh t] marks the connection [t] as alive. This should be called
     when packets are received. *)

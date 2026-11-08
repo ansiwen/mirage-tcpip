@@ -55,6 +55,7 @@ type t = {
   mutable state: state;
   mutable timer: unit Lwt.t;
   mutable start: int64;
+  mutable stopped: bool;
 }
 (** A keep-alive timer *)
 
@@ -78,13 +79,18 @@ let create configuration callback =
   let state = alive in
   let timer = Lwt.return_unit in
   let start = Mirage_mtime.elapsed_ns () in
-  let t = { configuration; callback; state; timer; start } in
+  let t = { configuration; callback; state; timer; start; stopped = false } in
   t.timer <- restart t;
   t
 
-let refresh t =
-  t.start <- Mirage_mtime.elapsed_ns ();
-  t.state <- alive;
-  Lwt.cancel t.timer;
-  t.timer <- restart t
+let stop t =
+  t.stopped <- true;
+  Lwt.cancel t.timer
 
+let refresh t =
+  if not t.stopped then begin
+    t.start <- Mirage_mtime.elapsed_ns ();
+    t.state <- alive;
+    Lwt.cancel t.timer;
+    t.timer <- restart t
+  end

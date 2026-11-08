@@ -38,6 +38,7 @@ module Rx = struct
     mutable watcher: int32 Lwt_mvar.t option;
     mutable max_size: int32;
     mutable cur_size: int32;
+    mutable eof: bool; (* the end of stream was delivered to the reader *)
     mutable holdback: int32;
     (* Space freed by the application that is not advertised yet (receiver
        silly window syndrome avoidance, RFC 1122 4.2.3.3): the right edge of
@@ -52,7 +53,7 @@ module Rx = struct
     let readers = Lwt_dllist.create () in
     let watcher = None in
     let cur_size = 0l in
-    { q; wnd; readers; max_size; cur_size; watcher; holdback = 0l;
+    { q; wnd; readers; max_size; cur_size; watcher; holdback = 0l; eof = false;
       on_window_update }
 
   let sws_threshold t =
@@ -98,19 +99,24 @@ module Rx = struct
         update_window t
       | Some u ->
         (* handed straight to a waiting reader: arrived and consumed *)
+        if s = None then t.eof <- true;
         Lwt.wakeup u s;
         consumed t (seglen s)
     end;
     Lwt.return_unit
 
   let take_l t =
-    if Lwt_dllist.is_empty t.q then begin
+    if t.eof then
+      (* once the end of stream has been read, every further read is too *)
+      Lwt.return None
+    else if Lwt_dllist.is_empty t.q then begin
       let th,u = Lwt.wait () in
       let node = Lwt_dllist.add_r u t.readers in
       Lwt.on_cancel th (fun _ -> Lwt_dllist.remove node);
       th
     end else begin
       let s = Lwt_dllist.take_l t.q in
+      if s = None then t.eof <- true;
       t.cur_size <- Int32.(sub t.cur_size (of_int (seglen s)));
       consumed t (seglen s);
       Lwt.return s

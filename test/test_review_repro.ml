@@ -723,6 +723,101 @@ let time_wait () =
   in
   `Long_kick (10, true, (`SYNACK, fsm), sut, (fun ip -> send_client_syn ip))
 
+(* ---- Connection lifecycle ---- *)
+
+let tcp stack = VNETIF_STACK.Stack.tcp stack
+
+(* 31. no keep-alive probes once the connection is closed *)
+let keepalive_stops () =
+  let after_close = ref 0 in
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `SYN -> syn_ack ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `FIN
+    | `FIN when Tcp_wire.get_fin data ->
+      WIRE.xmit ~ip (reply_id_from ~src ~dst data) ~fin:true ~rx_ack:(ack data)
+        ~seq:(Sequence.of_int32 1000001l) ~window ~options:[] Cstruct.empty
+      >|= Result.get_ok >|= fun () -> Fsm_next `LASTACK
+    | `LASTACK when Tcp_wire.get_ack_number data = 1000002l -> Lwt.return (Fsm_next `QUIET)
+    | `QUIET -> incr after_close; Lwt.return (Fsm_next `QUIET)
+    | s -> Lwt.return (Fsm_next s)
+  in
+  let sut stack =
+    let keepalive = Tcpip.Tcp.Keepalive.{ after = Duration.of_ms 500;
+                                          interval = Duration.of_ms 500; probes = 5 } in
+    or_error "connect" (VNETIF_STACK.Stack.TCP.create_connection ~keepalive (tcp stack))
+      (Ipaddr.V4 server_ip, 80) >>= fun flow ->
+    VNETIF_STACK.Stack.TCP.close flow >>= fun () ->
+    Mirage_sleep.ns (Duration.of_ms 3500) >|= fun () ->
+    Alcotest.(check int) "packets sent after the connection was closed" 0 !after_close
+  in
+  `Long_kick (6, false, (`SYN, fsm), sut, no_kick)
+
+(* 32. reading again after the end of stream returns Eof again *)
+let read_after_eof () =
+  let fsm ip state ~src ~dst data =
+    match state with
+    | `SYN -> syn_ack ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `ACK
+    | `ACK ->
+      WIRE.xmit ~ip (reply_id_from ~src ~dst data) ~fin:true ~rx_ack:(ack data)
+        ~seq:(Sequence.of_int32 1000001l) ~window ~options:[] Cstruct.empty
+      >|= Result.get_ok >|= fun () -> Fsm_done
+    | s -> Lwt.return (Fsm_next s)
+  in
+  `Client ((`SYN, fsm), sut_connects_then (fun flow ->
+      VNETIF_STACK.Stack.TCP.read flow >>= fun r1 ->
+      Lwt.pick [ VNETIF_STACK.Stack.TCP.read flow >|= Option.some;
+                 (Mirage_sleep.ns (Duration.of_sec 1) >|= fun () -> None) ] >|= fun r2 ->
+      match r1, r2 with
+      | Ok `Eof, Some (Ok `Eof) -> ()
+      | Ok `Eof, None -> Alcotest.fail "second read after Eof blocked"
+      | _ -> Alcotest.fail "expected Eof twice"))
+
+(* 33. disconnect fails pending connects and stops half-open connections *)
+let disconnect_cleans_up () =
+  let synacks_after = ref 0 and disconnected = ref false in
+  let fsm _ip state ~src:_ ~dst:_ data =
+    if !disconnected && Tcp_wire.get_syn data && Tcp_wire.get_ack data then incr synacks_after;
+    Lwt.return (Fsm_next state)
+  in
+  let sut stack =
+    VNETIF_STACK.Stack.TCP.listen (tcp stack) ~port:80 (fun _ -> Lwt.return_unit);
+    (* an active open the peer never answers *)
+    let pending = VNETIF_STACK.Stack.TCP.create_connection (tcp stack) (Ipaddr.V4 server_ip, 81) in
+    Mirage_sleep.ns (Duration.of_ms 300) >>= fun () ->
+    disconnected := true;
+    VNETIF_STACK.Stack.TCP.disconnect (tcp stack) >>= fun () ->
+    Lwt.pick [ (pending >|= fun r -> Some (Result.is_error r));
+               (Mirage_sleep.ns (Duration.of_ms 500) >|= fun () -> None) ] >>= fun r ->
+    Alcotest.(check (option bool)) "pending connect failed on disconnect" (Some true) r;
+    Mirage_sleep.ns (Duration.of_ms 2000) >|= fun () ->
+    Alcotest.(check int) "SYN-ACKs retransmitted after disconnect" 0 !synacks_after
+  in
+  `Long_kick (5, false, (`ANY, fsm), sut, (fun ip -> send_client_syn ip))
+
+(* 34. two concurrent closes send one FIN (one sequence number) *)
+let concurrent_close () =
+  let fin_seqs = Hashtbl.create 3 in
+  let fsm ip state ~src ~dst data =
+    let _, payload = parse data in
+    match state with
+    | `SYN -> syn_ack ~window:100 ip ~src ~dst ~isn:1000000l data >|= fun () -> Fsm_next `DATA
+    | `DATA when Cstruct.length payload > 0 || Tcp_wire.get_fin data ->
+      if Tcp_wire.get_fin data then Hashtbl.replace fin_seqs (Tcp_wire.get_sequence data) ();
+      WIRE.xmit ~ip (reply_id_from ~src ~dst data) ~rx_ack:(ack data)
+        ~seq:(Sequence.of_int32 1000001l) ~window:100 ~options:[] Cstruct.empty
+      >|= Result.get_ok >|= fun () -> Fsm_next `DATA
+    | s -> Lwt.return (Fsm_next s)
+  in
+  let sut stack =
+    or_error "connect" (VNETIF_STACK.Stack.TCP.create_connection (tcp stack))
+      (Ipaddr.V4 server_ip, 80) >>= fun flow ->
+    VNETIF_STACK.Stack.TCP.write flow (Cstruct.create 300) >>= fun _ ->
+    Lwt.join [ VNETIF_STACK.Stack.TCP.close flow; VNETIF_STACK.Stack.TCP.close flow ] >>= fun () ->
+    Mirage_sleep.ns (Duration.of_ms 1500) >|= fun () ->
+    Alcotest.(check int) "distinct FIN sequence numbers" 1 (Hashtbl.length fin_seqs)
+  in
+  `Long_kick (5, false, (`SYN, fsm), sut, no_kick)
+
 let run_test name = function
   | `Client (fsm, sut) -> fun () ->
     let backend = VNETIF_STACK.create_backend () in
@@ -770,5 +865,9 @@ let suite = [
   "no MSS option means 536 bytes", `Quick, run_test "r28" (default_mss ());
   "SYN RTO 1s, then 3s data RTO", `Quick, run_test "r29" (syn_rto ());
   "TIME-WAIT re-ACKs FIN and accepts a new SYN", `Quick, run_test "r30" (time_wait ());
+  "keep-alive stops when the connection closes", `Quick, run_test "r31" (keepalive_stops ());
+  "read after Eof returns Eof", `Quick, run_test "r32" (read_after_eof ());
+  "disconnect cleans up pending connections", `Quick, run_test "r33" (disconnect_cleans_up ());
+  "concurrent close sends one FIN", `Quick, run_test "r34" (concurrent_close ());
   "retransmission timeout wakes reader and writer", `Slow, run_test "r7" (rexmit_timeout_wakes_reader ());
 ]
